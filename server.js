@@ -25,7 +25,7 @@ const MASTER_ADMIN_ID = process.env.MASTER_ADMIN_ID || 'MASTER-ADMIN-001';
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
 if (process.env.APP_ORIGIN) app.use(cors({ origin: process.env.APP_ORIGIN, credentials: true }));
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '4mb' }));
 app.use('/api/', rateLimit({
   windowMs: 60_000,
   limit: 300,
@@ -95,6 +95,76 @@ async function telegramApi(token, method, payload = {}) {
   return data.result;
 }
 
+async function telegramMultipart(token, method, fields, fileField, buffer, filename, mimeType) {
+  const form = new FormData();
+  for (const [k,v] of Object.entries(fields || {})) {
+    if (v !== undefined && v !== null) form.append(k, String(v));
+  }
+  form.append(fileField, new Blob([buffer], { type:mimeType || 'application/octet-stream' }), filename || 'upload.bin');
+  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method:'POST', body:form, signal:AbortSignal.timeout(25_000)
+  });
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data?.ok) {
+    const err = new Error(data?.description || `Telegram ${method} failed (${response.status})`);
+    err.code = 'TELEGRAM_API_ERROR';
+    throw err;
+  }
+  return data.result;
+}
+function decodeBase64Upload(dataBase64, maxBytes=2_500_000) {
+  const raw = String(dataBase64 || '').replace(/^data:[^;]+;base64,/, '');
+  if (!raw || raw.length > Math.ceil(maxBytes * 4 / 3) + 16) throw Object.assign(new Error('Upload is too large. Keep each file under 2.5 MB after image compression.'), { code:'UPLOAD_TOO_LARGE' });
+  const buffer = Buffer.from(raw, 'base64');
+  if (!buffer.length || buffer.length > maxBytes) throw Object.assign(new Error('Upload is too large. Keep each file under 2.5 MB after image compression.'), { code:'UPLOAD_TOO_LARGE' });
+  return buffer;
+}
+async function saveOutboundTelegramMedia(conversation, reqUserId, buffer, filename, mimeType, kind, source={}) {
+  const chatId = conversation.customer_metadata?.telegram_chat_id;
+  if (!chatId) throw new Error('Telegram chat ID is missing for this customer');
+  const token = decryptToken(conversation);
+  const isImage = kind === 'image' || String(mimeType || '').startsWith('image/');
+  const sent = isImage
+    ? await telegramMultipart(token, 'sendPhoto', { chat_id:chatId }, 'photo', buffer, filename, mimeType)
+    : await telegramMultipart(token, 'sendDocument', { chat_id:chatId }, 'document', buffer, filename, mimeType);
+  const externalMessageId = `${chatId}:${sent.message_id}`;
+  const body = isImage ? `[Image: ${filename}]` : `[File: ${filename}]`;
+  const media = { kind:isImage?'image':'file', filename, mimeType, size:buffer.length, ...source };
+  const { rows:[saved] } = await pool.query(
+    `INSERT INTO messages(conversation_id,sender_type,sender_user_id,body,external_message_id,media,created_at)
+     VALUES($1,'agent',$2,$3,$4,$5::jsonb,to_timestamp($6)) RETURNING *`,
+    [conversation.id,reqUserId,body,externalMessageId,JSON.stringify(media),Number(sent.date || Math.floor(Date.now()/1000))]
+  );
+  await pool.query(`UPDATE conversations SET unread_count=0,last_message_at=now(),updated_at=now() WHERE id=$1`, [conversation.id]);
+  return saved;
+}
+async function sendAutomationMessage(conversation, triggerType, actorUserId=null, assigneeUserId=null) {
+  const { rows:[rule] } = await pool.query(
+    `SELECT enabled,body FROM automation_messages WHERE workspace_id=$1 AND trigger_type=$2`,
+    [conversation.workspace_id,triggerType]
+  );
+  if (!rule?.enabled || !String(rule.body || '').trim()) return null;
+  const chatId = conversation.customer_metadata?.telegram_chat_id;
+  if (!chatId) return null;
+  const token = decryptToken(conversation);
+  let agentName = '';
+  if (assigneeUserId) { const { rows:[u] } = await pool.query('SELECT name FROM users WHERE id=$1',[assigneeUserId]); agentName = u?.name || ''; }
+  const { rows:[ws] } = await pool.query('SELECT name FROM workspaces WHERE id=$1',[conversation.workspace_id]);
+  const text = String(rule.body).trim()
+    .replace(/\{customer\}/g, String(conversation.display_name || ''))
+    .replace(/\{agent\}/g, agentName)
+    .replace(/\{workspace\}/g, String(ws?.name || ''));
+  const sent = await telegramApi(token,'sendMessage',{ chat_id:chatId, text });
+  const externalMessageId = `${chatId}:${sent.message_id}`;
+  const { rows:[saved] } = await pool.query(
+    `INSERT INTO messages(conversation_id,sender_type,sender_user_id,body,external_message_id,media,created_at)
+     VALUES($1,'bot',$2,$3,$4,$5::jsonb,to_timestamp($6)) RETURNING *`,
+    [conversation.id,actorUserId,text,externalMessageId,JSON.stringify({ automation:triggerType }),Number(sent.date || Math.floor(Date.now()/1000))]
+  );
+  await pool.query(`UPDATE conversations SET last_message_at=GREATEST(COALESCE(last_message_at,now()),to_timestamp($2)),updated_at=now() WHERE id=$1`, [conversation.id,Number(sent.date || Math.floor(Date.now()/1000))]);
+  return saved;
+}
+
 async function translateText(text, targetLanguage) {
   const key = String(process.env.GOOGLE_TRANSLATE_API_KEY || '').trim();
   if (!key) {
@@ -155,6 +225,29 @@ function workspaceScope(req, requestedWorkspaceId) {
   if (req.user.role === 'MASTER_ADMIN') return requestedWorkspaceId || null;
   return req.user.workspace_id;
 }
+
+async function branchUserIds(req, workspaceId) {
+  if (!workspaceId) return [];
+  if (req.user.role === 'TEAM_ADMIN') {
+    const { rows } = await pool.query(
+      `SELECT id FROM users WHERE workspace_id=$1 AND status='active' AND (id=$2 OR parent_user_id=$2)`,
+      [workspaceId, req.user.id]
+    );
+    return rows.map(r => r.id);
+  }
+  if (['AGENT','VIEWER'].includes(req.user.role)) return [req.user.id];
+  return [];
+}
+function dashboardPeriodStart(period) {
+  const now = new Date();
+  if (period === 'today') {
+    const d = new Date(now);
+    d.setUTCHours(0,0,0,0);
+    return d;
+  }
+  const days = period === 'month' ? 30 : 7;
+  return new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+}
 const asyncRoute = fn => (req,res,next) => Promise.resolve(fn(req,res,next)).catch(next);
 
 let readinessPromise = null;
@@ -186,7 +279,7 @@ async function ensureReady() {
 app.get('/api/health', async (req,res) => {
   try {
     await ensureReady();
-    res.json({ ok: true, service: 'orbitdesk', database: 'ready', telegram: 'webhook-enabled', runtime: process.env.VERCEL ? 'vercel' : 'node' });
+    res.json({ ok: true, service: 'dlxn17-customer-support', database: 'ready', telegram: 'webhook-enabled', runtime: process.env.VERCEL ? 'vercel' : 'node' });
   } catch (err) {
     console.error('Health/readiness failed:', err.message);
     if (err.code === 'SETUP_REQUIRED') {
@@ -562,7 +655,7 @@ function telegramMessageBody(message) {
 
 // PUBLIC TELEGRAM WEBHOOK. Authentication is the per-bot Telegram secret header, not a user JWT.
 app.post('/api/telegram/webhook/:botId', asyncRoute(async (req,res) => {
-  const { rows:[bot] } = await pool.query('SELECT id,workspace_id,webhook_secret FROM bots WHERE id=$1', [req.params.botId]);
+  const { rows:[bot] } = await pool.query('SELECT id,workspace_id,webhook_secret,token_ciphertext,token_iv,token_tag FROM bots WHERE id=$1', [req.params.botId]);
   if (!bot || !bot.webhook_secret) return res.status(404).json({ ok:false });
   const supplied = String(req.get('x-telegram-bot-api-secret-token') || '');
   const expected = String(bot.webhook_secret);
@@ -582,16 +675,24 @@ app.post('/api/telegram/webhook/:botId', asyncRoute(async (req,res) => {
   const body = telegramMessageBody(message);
   const externalMessageId = `${chatId}:${message.message_id}`;
 
-  const { rows:[customer] } = await pool.query(
+  const metadataJson = JSON.stringify({ telegram_chat_id:chatId, telegram_username:username, chat_type:message.chat.type });
+  const insertedCustomer = await pool.query(
     `INSERT INTO customers(workspace_id,platform,external_user_id,display_name,metadata)
      VALUES($1,'telegram',$2,$3,$4::jsonb)
-     ON CONFLICT(workspace_id,platform,external_user_id)
-     DO UPDATE SET display_name=excluded.display_name,
-                   metadata=customers.metadata || excluded.metadata,
-                   updated_at=now()
+     ON CONFLICT(workspace_id,platform,external_user_id) DO NOTHING
      RETURNING *`,
-    [bot.workspace_id,externalUserId,displayName,JSON.stringify({ telegram_chat_id:chatId, telegram_username:username, chat_type:message.chat.type })]
+    [bot.workspace_id,externalUserId,displayName,metadataJson]
   );
+  const isNewCustomer = insertedCustomer.rowCount > 0;
+  let customer = insertedCustomer.rows[0];
+  if (!customer) {
+    const updatedCustomer = await pool.query(
+      `UPDATE customers SET display_name=$3,metadata=metadata || $4::jsonb,updated_at=now()
+        WHERE workspace_id=$1 AND platform='telegram' AND external_user_id=$2 RETURNING *`,
+      [bot.workspace_id,externalUserId,displayName,metadataJson]
+    );
+    customer = updatedCustomer.rows[0];
+  }
 
   let { rows:[conversation] } = await pool.query(
     `SELECT * FROM conversations
@@ -602,8 +703,8 @@ app.post('/api/telegram/webhook/:botId', asyncRoute(async (req,res) => {
   if (!conversation) {
     try {
       const created = await pool.query(
-        `INSERT INTO conversations(workspace_id,bot_id,customer_id,status,unread_count,last_message_at)
-         VALUES($1,$2,$3,'waiting',0,now()) RETURNING *`,
+        `INSERT INTO conversations(workspace_id,bot_id,customer_id,status,unread_count,last_message_at,waiting_since)
+         VALUES($1,$2,$3,'waiting',0,now(),now()) RETURNING *`,
         [bot.workspace_id,bot.id,customer.id]
       );
       conversation = created.rows[0];
@@ -627,13 +728,32 @@ app.post('/api/telegram/webhook/:botId', asyncRoute(async (req,res) => {
   if (inserted.rowCount) {
     await pool.query(
       `UPDATE conversations
-          SET status=CASE WHEN status='resolved' THEN 'waiting' ELSE status END,
-              assigned_user_id=CASE WHEN status='resolved' THEN NULL ELSE assigned_user_id END,
+          SET status=CASE WHEN status IN ('resolved','deleted') THEN 'waiting' ELSE status END,
+              assigned_user_id=CASE WHEN status IN ('resolved','deleted') THEN NULL ELSE assigned_user_id END,
+              assigned_at=CASE WHEN status IN ('resolved','deleted') THEN NULL ELSE assigned_at END,
+              resolved_at=CASE WHEN status IN ('resolved','deleted') THEN NULL ELSE resolved_at END,
+              deleted_at=CASE WHEN status IN ('resolved','deleted') THEN NULL ELSE deleted_at END,
+              deleted_by=CASE WHEN status IN ('resolved','deleted') THEN NULL ELSE deleted_by END,
+              waiting_since=CASE WHEN status IN ('resolved','deleted') THEN to_timestamp($2) WHEN status='waiting' THEN COALESCE(waiting_since,created_at) ELSE waiting_since END,
               unread_count=unread_count+1,
               last_message_at=to_timestamp($2),updated_at=now()
         WHERE id=$1`,
       [conversation.id,Number(message.date || Math.floor(Date.now()/1000))]
     );
+    const isReopenedChat = ['resolved','deleted'].includes(conversation.status);
+    if (isNewCustomer || isReopenedChat) {
+      const automationConversation = {
+        ...conversation,
+        workspace_id:bot.workspace_id,
+        token_ciphertext:bot.token_ciphertext,
+        token_iv:bot.token_iv,
+        token_tag:bot.token_tag,
+        customer_metadata:{ telegram_chat_id:chatId },
+        display_name:displayName
+      };
+      try { await sendAutomationMessage(automationConversation,'new_customer',null); }
+      catch (err) { console.warn('new customer auto message failed:', err.message); }
+    }
   }
   res.json({ ok:true });
 }));
@@ -655,27 +775,50 @@ async function getConversationForUser(req, conversationId, needReply=false) {
   if (req.user.role === 'WORKSPACE_ADMIN') return c;
   const { rows:[permission] } = await pool.query('SELECT can_read,can_reply FROM bot_assignments WHERE bot_id=$1 AND user_id=$2', [c.bot_id,req.user.id]);
   if (!permission || !permission.can_read || (needReply && !permission.can_reply)) return null;
+  if (req.user.role === 'AGENT') {
+    if (c.status === 'waiting' && !c.assigned_user_id) return c;
+    return c.assigned_user_id === req.user.id ? c : null;
+  }
+  if (req.user.role === 'TEAM_ADMIN') {
+    if (c.status === 'waiting' && !c.assigned_user_id) return c;
+    const ids = await branchUserIds(req, c.workspace_id);
+    return c.assigned_user_id && ids.includes(c.assigned_user_id) ? c : null;
+  }
+  if (req.user.role === 'VIEWER') return c.assigned_user_id === req.user.id ? c : null;
   return c;
 }
 
 app.get('/api/conversations', auth, asyncRoute(async (req,res) => {
   const ws = workspaceScope(req, req.query.workspaceId);
   if (!ws) return res.json({ items:[] });
-  const status = String(req.query.status || '').trim();
-  if (status && !['waiting','in_progress','resolved'].includes(status)) return res.status(400).json({ error:'Invalid conversation status' });
+  const status = String(req.query.status || 'active').trim();
+  if (!['active','waiting','in_progress','history','resolved','deleted'].includes(status)) return res.status(400).json({ error:'Invalid conversation status' });
   const params = [ws];
   let permissionJoin = '';
+  let roleSql = '';
   if (!['MASTER_ADMIN','WORKSPACE_ADMIN'].includes(req.user.role)) {
     params.push(req.user.id);
     permissionJoin = `JOIN bot_assignments p ON p.bot_id=c.bot_id AND p.user_id=$2 AND p.can_read=true`;
+    if (req.user.role === 'TEAM_ADMIN') {
+      const ids = await branchUserIds(req, ws);
+      params.push(ids);
+      roleSql = `AND ((c.status='waiting' AND c.assigned_user_id IS NULL) OR c.assigned_user_id = ANY($${params.length}::varchar[]))`;
+    } else if (req.user.role === 'AGENT') {
+      roleSql = `AND ((c.status='waiting' AND c.assigned_user_id IS NULL) OR c.assigned_user_id=$2)`;
+    } else if (req.user.role === 'VIEWER') {
+      roleSql = `AND c.assigned_user_id=$2`;
+    }
   }
-  if (status) params.push(status);
-  const statusSql = status ? `AND c.status=$${params.length}` : '';
+  let statusSql = '';
+  if (status === 'active') statusSql = `AND c.status IN ('waiting','in_progress')`;
+  else if (status === 'history') statusSql = `AND c.status IN ('resolved','deleted')`;
+  else { params.push(status); statusSql = `AND c.status=$${params.length}`; }
   const tag = String(req.query.tag || '').trim();
   if (tag) params.push(tag);
   const tagSql = tag ? `AND $${params.length}=ANY(cu.tags)` : '';
   const { rows } = await pool.query(
-    `SELECT c.id,c.workspace_id,c.bot_id,c.customer_id,c.assigned_user_id,c.status,c.priority,c.unread_count,c.last_message_at,c.created_at,c.remark,c.remark_updated_at,
+    `SELECT c.id,c.workspace_id,c.bot_id,c.customer_id,c.assigned_user_id,c.status,c.priority,c.unread_count,c.last_message_at,c.created_at,
+            c.remark,c.remark_updated_at,c.assigned_at,c.resolved_at,c.deleted_at,c.deleted_by,
             cu.display_name,cu.external_user_id,cu.tags,cu.metadata AS customer_metadata,
             b.name AS bot_name,b.external_bot_username,
             au.name AS assigned_name,
@@ -685,12 +828,148 @@ app.get('/api/conversations', auth, asyncRoute(async (req,res) => {
        JOIN customers cu ON cu.id=c.customer_id
        JOIN bots b ON b.id=c.bot_id
        LEFT JOIN users au ON au.id=c.assigned_user_id
-       LEFT JOIN LATERAL (SELECT body FROM messages m WHERE m.conversation_id=c.id ORDER BY m.created_at DESC LIMIT 1) lm ON true
-      WHERE c.workspace_id=$1 ${statusSql} ${tagSql}
+       LEFT JOIN LATERAL (SELECT body FROM messages m WHERE m.conversation_id=c.id AND m.deleted_at IS NULL ORDER BY m.created_at DESC LIMIT 1) lm ON true
+      WHERE c.workspace_id=$1 ${statusSql} ${roleSql} ${tagSql}
       ORDER BY c.last_message_at DESC NULLS LAST, c.created_at DESC
       LIMIT 300`, params
   );
   res.json({ items:rows });
+}));
+
+app.get('/api/inbox/counts', auth, asyncRoute(async (req,res) => {
+  const ws = workspaceScope(req, req.query.workspaceId);
+  if (!ws && req.user.role !== 'MASTER_ADMIN') return res.json({ waiting:0,inProgress:0,history:0,resolved:0,deleted:0,unread:0 });
+  const params=[ws];
+  let permissionJoin='', roleSql='';
+  if (!['MASTER_ADMIN','WORKSPACE_ADMIN'].includes(req.user.role)) {
+    params.push(req.user.id);
+    permissionJoin=`JOIN bot_assignments p ON p.bot_id=c.bot_id AND p.user_id=$2 AND p.can_read=true`;
+    if (req.user.role==='TEAM_ADMIN') {
+      const ids=await branchUserIds(req,ws); params.push(ids);
+      roleSql=`AND ((c.status='waiting' AND c.assigned_user_id IS NULL) OR c.assigned_user_id = ANY($${params.length}::varchar[]))`;
+    } else if (req.user.role==='AGENT') roleSql=`AND ((c.status='waiting' AND c.assigned_user_id IS NULL) OR c.assigned_user_id=$2)`;
+    else roleSql=`AND c.assigned_user_id=$2`;
+  }
+  const {rows:[r]}=await pool.query(
+    `SELECT
+       count(*) FILTER (WHERE c.status='waiting')::int AS waiting,
+       count(*) FILTER (WHERE c.status='in_progress')::int AS in_progress,
+       count(*) FILTER (WHERE c.status='resolved')::int AS resolved,
+       count(*) FILTER (WHERE c.status='deleted')::int AS deleted,
+       count(*) FILTER (WHERE c.status IN ('resolved','deleted'))::int AS history,
+       COALESCE(sum(c.unread_count) FILTER (WHERE c.status IN ('waiting','in_progress')),0)::int AS unread
+     FROM conversations c ${permissionJoin}
+     WHERE ($1::uuid IS NULL OR c.workspace_id=$1) ${roleSql}`, params
+  );
+  res.json({waiting:r.waiting||0,inProgress:r.in_progress||0,resolved:r.resolved||0,deleted:r.deleted||0,history:r.history||0,unread:r.unread||0});
+}));
+
+app.get('/api/dashboard', auth, asyncRoute(async (req,res) => {
+  const requestedWs = String(req.query.workspaceId || '').trim() || null;
+  const ws = req.user.role === 'MASTER_ADMIN' ? requestedWs : req.user.workspace_id;
+  if (req.user.role !== 'MASTER_ADMIN' && requestedWs && String(requestedWs)!==String(req.user.workspace_id)) return res.status(403).json({error:'Cross-workspace dashboard access denied'});
+  const period = ['today','week','month'].includes(String(req.query.period)) ? String(req.query.period) : 'today';
+  const start = dashboardPeriodStart(period);
+  const allScope = ['MASTER_ADMIN','WORKSPACE_ADMIN'].includes(req.user.role);
+  const scopeIds = allScope ? [] : await branchUserIds(req, req.user.workspace_id);
+  const scopeParam = scopeIds.length ? scopeIds : [req.user.id];
+  const common = [ws, start, scopeParam, allScope];
+
+  const {rows:[received]} = await pool.query(
+    `SELECT count(DISTINCT c.customer_id)::int AS customers, count(DISTINCT c.id)::int AS conversations
+       FROM conversations c
+       JOIN messages m ON m.conversation_id=c.id AND m.sender_type='customer' AND m.created_at >= $2
+      WHERE ($1::uuid IS NULL OR c.workspace_id=$1)
+        AND ($4::boolean OR c.assigned_user_id = ANY($3::varchar[]) OR EXISTS (
+          SELECT 1 FROM conversation_assignment_events ae WHERE ae.conversation_id=c.id AND ae.assigned_user_id = ANY($3::varchar[])
+        ))`, common
+  );
+  const {rows:[assigned]} = await pool.query(
+    `SELECT count(DISTINCT ae.conversation_id)::int AS n
+       FROM conversation_assignment_events ae
+      WHERE ae.created_at >= $2 AND ($1::uuid IS NULL OR ae.workspace_id=$1)
+        AND ($4::boolean OR ae.assigned_user_id = ANY($3::varchar[]))`, common
+  );
+  const {rows:[deleted]} = await pool.query(
+    `SELECT count(DISTINCT c.id)::int AS n FROM conversations c
+      WHERE c.deleted_at >= $2 AND ($1::uuid IS NULL OR c.workspace_id=$1)
+        AND ($4::boolean OR c.deleted_by = ANY($3::varchar[]) OR c.assigned_user_id = ANY($3::varchar[]) OR EXISTS (
+          SELECT 1 FROM conversation_assignment_events ae WHERE ae.conversation_id=c.id AND ae.assigned_user_id = ANY($3::varchar[])
+        ))`, common
+  );
+  const {rows:[resolved]} = await pool.query(
+    `SELECT count(DISTINCT c.id)::int AS n FROM conversations c
+      WHERE c.resolved_at >= $2 AND ($1::uuid IS NULL OR c.workspace_id=$1)
+        AND ($4::boolean OR c.assigned_user_id = ANY($3::varchar[]) OR EXISTS (
+          SELECT 1 FROM conversation_assignment_events ae WHERE ae.conversation_id=c.id AND ae.assigned_user_id = ANY($3::varchar[])
+        ))`, common
+  );
+  const {rows:[active]} = await pool.query(
+    `SELECT count(*)::int AS n FROM conversations c
+      WHERE c.status='in_progress' AND ($1::uuid IS NULL OR c.workspace_id=$1)
+        AND ($4::boolean OR c.assigned_user_id = ANY($3::varchar[]))`, common
+  );
+  const {rows:[totalCustomers]} = await pool.query(
+    `SELECT count(DISTINCT c.customer_id)::int AS n FROM conversations c
+      WHERE ($1::uuid IS NULL OR c.workspace_id=$1)
+        AND ($4::boolean OR c.assigned_user_id = ANY($3::varchar[]) OR EXISTS (
+          SELECT 1 FROM conversation_assignment_events ae WHERE ae.conversation_id=c.id AND ae.assigned_user_id = ANY($3::varchar[])
+        ))`, common
+  );
+
+  let waitingParams, waitingSql;
+  if (allScope) {
+    waitingParams=[ws];
+    waitingSql=`SELECT count(*)::int AS n,
+      COALESCE(EXTRACT(EPOCH FROM (now()-min(COALESCE(c.waiting_since,c.created_at))))::int,0) AS oldest_seconds
+      FROM conversations c WHERE c.status='waiting' AND ($1::uuid IS NULL OR c.workspace_id=$1)`;
+  } else {
+    waitingParams=[req.user.workspace_id,req.user.id];
+    waitingSql=`SELECT count(*)::int AS n,
+      COALESCE(EXTRACT(EPOCH FROM (now()-min(COALESCE(c.waiting_since,c.created_at))))::int,0) AS oldest_seconds
+      FROM conversations c JOIN bot_assignments ba ON ba.bot_id=c.bot_id AND ba.user_id=$2 AND ba.can_read=true
+      WHERE c.status='waiting' AND c.assigned_user_id IS NULL AND c.workspace_id=$1`;
+  }
+  const {rows:[waiting]}=await pool.query(waitingSql,waitingParams);
+
+  const userWhere=[]; const userParams=[];
+  if (ws) { userParams.push(ws); userWhere.push(`u.workspace_id=$${userParams.length}`); }
+  if (!allScope) { userParams.push(scopeParam); userWhere.push(`u.id = ANY($${userParams.length}::varchar[])`); }
+  userParams.push(start); const startParam=userParams.length;
+  const {rows:team}=await pool.query(
+    `SELECT u.id,u.name,u.role,
+      (SELECT count(*)::int FROM conversations c WHERE c.assigned_user_id=u.id AND c.status='in_progress') AS active_now,
+      (SELECT count(DISTINCT ae.conversation_id)::int FROM conversation_assignment_events ae WHERE ae.assigned_user_id=u.id AND ae.created_at >= $${startParam}) AS assigned_period,
+      (SELECT count(*)::int FROM conversations c WHERE c.deleted_by=u.id AND c.deleted_at >= $${startParam}) AS deleted_period,
+      (SELECT count(*)::int FROM messages m WHERE m.sender_user_id=u.id AND m.sender_type='agent' AND m.created_at >= $${startParam} AND m.deleted_at IS NULL) AS replies_period
+     FROM users u
+     WHERE u.status='active' AND u.role IN ('WORKSPACE_ADMIN','TEAM_ADMIN','AGENT') ${userWhere.length?'AND '+userWhere.join(' AND '):''}
+     ORDER BY CASE u.role WHEN 'WORKSPACE_ADMIN' THEN 1 WHEN 'TEAM_ADMIN' THEN 2 ELSE 3 END,u.name
+     LIMIT 100`, userParams
+  );
+
+  const {rows:[avgResponse]} = await pool.query(
+    `WITH scoped AS (
+       SELECT c.id FROM conversations c
+       WHERE ($1::uuid IS NULL OR c.workspace_id=$1)
+         AND ($4::boolean OR c.assigned_user_id = ANY($3::varchar[]) OR EXISTS (
+           SELECT 1 FROM conversation_assignment_events ae WHERE ae.conversation_id=c.id AND ae.assigned_user_id = ANY($3::varchar[])
+         ))
+     ), pairs AS (
+       SELECT s.id,
+         (SELECT min(m.created_at) FROM messages m WHERE m.conversation_id=s.id AND m.sender_type='customer' AND m.created_at >= $2) first_customer,
+         (SELECT min(m.created_at) FROM messages m WHERE m.conversation_id=s.id AND m.sender_type IN ('agent','bot') AND m.created_at >= $2) first_reply
+       FROM scoped s
+     )
+     SELECT COALESCE(avg(EXTRACT(EPOCH FROM (first_reply-first_customer))) FILTER (WHERE first_customer IS NOT NULL AND first_reply>=first_customer),0)::int AS seconds FROM pairs`, common
+  );
+
+  res.json({
+    period, periodStart:start.toISOString(),
+    scope: req.user.role==='MASTER_ADMIN'?(ws?'workspace':'all_workspaces'):req.user.role==='WORKSPACE_ADMIN'?'workspace':req.user.role==='TEAM_ADMIN'?'team':'self',
+    metrics:{received:Number(received.customers||0),assigned:Number(assigned.n||0),deleted:Number(deleted.n||0),resolved:Number(resolved.n||0),inProgress:Number(active.n||0),waiting:Number(waiting.n||0),totalCustomers:Number(totalCustomers.n||0),avgFirstResponseSeconds:Number(avgResponse.seconds||0),oldestWaitingSeconds:Number(waiting.oldest_seconds||0)},
+    team
+  });
 }));
 
 app.get('/api/conversations/:conversationId/messages', auth, asyncRoute(async (req,res) => {
@@ -708,6 +987,8 @@ app.post('/api/conversations/:conversationId/messages', auth, asyncRoute(async (
   const input = z.object({ text:z.string().min(1).max(4096) }).parse(req.body);
   const conversation = await getConversationForUser(req, req.params.conversationId, true);
   if (!conversation) return res.status(403).json({ error:'You do not have reply permission for this conversation' });
+  if (['resolved','deleted'].includes(conversation.status)) return res.status(409).json({ error:'This conversation is in History. Wait for a new customer message to reopen it.' });
+  if (conversation.status === 'waiting' || !conversation.assigned_user_id) return res.status(409).json({ error:'Assign the waiting conversation before replying.' });
   const chatId = conversation.customer_metadata?.telegram_chat_id;
   if (!chatId) return res.status(409).json({ error:'Telegram chat ID is missing for this customer' });
   const token = decryptToken(conversation);
@@ -718,13 +999,7 @@ app.post('/api/conversations/:conversationId/messages', auth, asyncRoute(async (
      VALUES($1,'agent',$2,$3,$4,to_timestamp($5)) RETURNING *`,
     [conversation.id,req.user.id,input.text,externalMessageId,Number(sent.date || Math.floor(Date.now()/1000))]
   );
-  await pool.query(
-    `UPDATE conversations
-        SET status=CASE WHEN status='waiting' THEN 'in_progress' ELSE status END,
-            assigned_user_id=COALESCE(assigned_user_id,$2),unread_count=0,last_message_at=now(),updated_at=now()
-      WHERE id=$1`,
-    [conversation.id, req.user.role === 'MASTER_ADMIN' ? null : req.user.id]
-  );
+  await pool.query(`UPDATE conversations SET unread_count=0,last_message_at=now(),updated_at=now() WHERE id=$1`, [conversation.id]);
   await audit(req,'conversation.reply','conversation',conversation.id,{botId:conversation.bot_id});
   res.status(201).json({ item:saved });
 }));
@@ -732,34 +1007,62 @@ app.post('/api/conversations/:conversationId/messages', auth, asyncRoute(async (
 app.post('/api/conversations/:conversationId/claim', auth, allow('WORKSPACE_ADMIN','TEAM_ADMIN','AGENT'), asyncRoute(async (req,res) => {
   const conversation = await getConversationForUser(req, req.params.conversationId, true);
   if (!conversation) return res.status(403).json({ error:'You do not have reply permission for this conversation' });
+  if (conversation.status !== 'waiting') return res.status(409).json({ error:'Only waiting conversations can be assigned' });
   if (conversation.assigned_user_id && conversation.assigned_user_id !== req.user.id) return res.status(409).json({ error:'Conversation is already assigned to another account' });
-  await pool.query(`UPDATE conversations SET assigned_user_id=$2,status='in_progress',updated_at=now() WHERE id=$1`, [conversation.id, req.user.id]);
+  await pool.query(`UPDATE conversations SET assigned_user_id=$2,status='in_progress',assigned_at=now(),resolved_at=NULL,deleted_at=NULL,deleted_by=NULL,waiting_since=NULL,updated_at=now() WHERE id=$1`, [conversation.id, req.user.id]);
+  await pool.query(`INSERT INTO conversation_assignment_events(workspace_id,conversation_id,assigned_user_id,assigned_by) VALUES($1,$2,$3,$4)`, [conversation.workspace_id,conversation.id,req.user.id,req.user.id]);
   await audit(req,'conversation.claim','conversation',conversation.id,{userId:req.user.id});
-  res.json({ ok:true });
+  try { await sendAutomationMessage(conversation,'assigned',req.user.id,req.user.id); }
+  catch (err) { console.warn('assigned auto message failed:', err.message); }
+  res.json({ ok:true, assignedUserId:req.user.id, status:'in_progress' });
 }));
 
 app.post('/api/conversations/:conversationId/assign', auth, allow('MASTER_ADMIN','WORKSPACE_ADMIN','TEAM_ADMIN'), asyncRoute(async (req,res) => {
   const input = z.object({ userId:z.string().min(1).nullable() }).parse(req.body);
   const conversation = await getConversationForUser(req, req.params.conversationId, false);
   if (!conversation) return res.status(404).json({ error:'Conversation not found in your scope' });
+  if (['resolved','deleted'].includes(conversation.status) && input.userId) return res.status(409).json({ error:'History conversations cannot be assigned until a new customer message reopens them' });
   if (input.userId) {
-    const { rows:[target] } = await pool.query('SELECT id,workspace_id,parent_user_id FROM users WHERE id=$1 AND status=\'active\'', [input.userId]);
+    const { rows:[target] } = await pool.query(`SELECT id,workspace_id,parent_user_id,role FROM users WHERE id=$1 AND status='active'`, [input.userId]);
     if (!target || String(target.workspace_id) !== String(conversation.workspace_id)) return res.status(400).json({ error:'Assignee is not in this workspace' });
+    if (!['WORKSPACE_ADMIN','TEAM_ADMIN','AGENT'].includes(target.role)) return res.status(400).json({ error:'Only Admin or Agent accounts can own conversations' });
     const { rows:[ba] } = await pool.query('SELECT can_read,can_reply FROM bot_assignments WHERE bot_id=$1 AND user_id=$2', [conversation.bot_id,target.id]);
-    if (!ba?.can_read) return res.status(409).json({ error:'Assign this bot to the selected ID before assigning the conversation' });
+    if (!ba?.can_read || !ba?.can_reply) return res.status(409).json({ error:'Assign this bot with read/reply permission to the selected ID before assigning the conversation' });
     if (req.user.role === 'TEAM_ADMIN' && target.parent_user_id !== req.user.id && target.id !== req.user.id) return res.status(403).json({ error:'Team admin can assign only within own branch' });
   }
-  await pool.query(`UPDATE conversations SET assigned_user_id=$2,status=CASE WHEN $2 IS NULL THEN 'waiting' ELSE 'in_progress' END,updated_at=now() WHERE id=$1`, [conversation.id,input.userId]);
+  await pool.query(
+    `UPDATE conversations SET assigned_user_id=$2,status=CASE WHEN $2 IS NULL THEN 'waiting' ELSE 'in_progress' END,
+       assigned_at=CASE WHEN $2 IS NULL THEN NULL ELSE now() END,resolved_at=NULL,deleted_at=NULL,deleted_by=NULL,
+       waiting_since=CASE WHEN $2 IS NULL THEN now() ELSE NULL END,updated_at=now() WHERE id=$1`,
+    [conversation.id,input.userId]
+  );
+  await pool.query(`INSERT INTO conversation_assignment_events(workspace_id,conversation_id,assigned_user_id,assigned_by) VALUES($1,$2,$3,$4)`, [conversation.workspace_id,conversation.id,input.userId,req.user.id]);
   await audit(req,'conversation.assign','conversation',conversation.id,{userId:input.userId});
-  res.json({ ok:true });
+  if (input.userId) {
+    try { await sendAutomationMessage(conversation,'assigned',req.user.id,input.userId); }
+    catch (err) { console.warn('assigned auto message failed:', err.message); }
+  }
+  res.json({ ok:true, assignedUserId:input.userId, status:input.userId?'in_progress':'waiting' });
 }));
 
 app.post('/api/conversations/:conversationId/resolve', auth, asyncRoute(async (req,res) => {
   const conversation = await getConversationForUser(req, req.params.conversationId, false);
   if (!conversation) return res.status(404).json({ error:'Conversation not found in your scope' });
-  await pool.query(`UPDATE conversations SET status='resolved',unread_count=0,updated_at=now() WHERE id=$1`, [conversation.id]);
+  if (conversation.status === 'deleted') return res.status(409).json({ error:'Deleted conversation is already in History' });
+  await pool.query(`UPDATE conversations SET status='resolved',unread_count=0,resolved_at=now(),deleted_at=NULL,deleted_by=NULL,waiting_since=NULL,updated_at=now() WHERE id=$1`, [conversation.id]);
   await audit(req,'conversation.resolve','conversation',conversation.id,{});
-  res.json({ ok:true });
+  res.json({ ok:true, status:'resolved' });
+}));
+
+app.delete('/api/conversations/:conversationId', auth, asyncRoute(async (req,res) => {
+  const conversation = await getConversationForUser(req, req.params.conversationId, false);
+  if (!conversation) return res.status(404).json({ error:'Conversation not found in your scope' });
+  if (req.user.role === 'VIEWER') return res.status(403).json({ error:'Viewer cannot delete conversations' });
+  if (req.user.role === 'AGENT' && conversation.assigned_user_id !== req.user.id) return res.status(403).json({ error:'Agents can delete only conversations assigned to themselves' });
+  if (conversation.status === 'deleted') return res.json({ ok:true, alreadyDeleted:true, status:'deleted' });
+  await pool.query(`UPDATE conversations SET status='deleted',unread_count=0,deleted_at=now(),deleted_by=$2,resolved_at=NULL,waiting_since=NULL,updated_at=now() WHERE id=$1`, [conversation.id,req.user.id]);
+  await audit(req,'conversation.delete','conversation',conversation.id,{assignedUserId:conversation.assigned_user_id});
+  res.json({ ok:true, status:'deleted' });
 }));
 
 
@@ -911,6 +1214,170 @@ app.get('/api/customers', auth, asyncRoute(async (req,res) => {
   res.json({items:rows});
 }));
 
+
+// ---- DLXN17 V4 Remake: chat uploads -------------------------------------------------
+app.post('/api/conversations/:conversationId/media', auth, asyncRoute(async (req,res) => {
+  const input = z.object({
+    filename:z.string().trim().min(1).max(255),
+    mimeType:z.string().trim().min(1).max(120),
+    kind:z.enum(['image','file']),
+    dataBase64:z.string().min(8)
+  }).parse(req.body);
+  const conversation = await getConversationForUser(req, req.params.conversationId, true);
+  if (!conversation) return res.status(403).json({ error:'You do not have reply permission for this conversation' });
+  if (['resolved','deleted'].includes(conversation.status)) return res.status(409).json({ error:'This conversation is in History. Wait for a new customer message to reopen it.' });
+  if (conversation.status === 'waiting' || !conversation.assigned_user_id) return res.status(409).json({ error:'Assign the waiting conversation before sending files.' });
+  const buffer = decodeBase64Upload(input.dataBase64);
+  const saved = await saveOutboundTelegramMedia(conversation,req.user.id,buffer,input.filename,input.mimeType,input.kind,{ source:'chat_upload' });
+  await audit(req,'conversation.media.send','conversation',conversation.id,{filename:input.filename,mimeType:input.mimeType,size:buffer.length});
+  res.status(201).json({ item:saved });
+}));
+
+// ---- Media Database ------------------------------------------------------------------
+app.get('/api/media/categories', auth, asyncRoute(async (req,res) => {
+  const ws = workspaceScope(req, req.query.workspaceId);
+  if (!ws) return res.json({ items:[] });
+  if (req.user.role !== 'MASTER_ADMIN' && String(req.user.workspace_id) !== String(ws)) return res.status(403).json({ error:'Cross-workspace media access denied' });
+  const { rows } = await pool.query(
+    `SELECT mc.id,mc.workspace_id,mc.name,mc.description,mc.created_at,mc.updated_at,
+            count(ma.id)::int AS asset_count,
+            COALESCE(sum(ma.byte_size),0)::bigint AS total_bytes
+       FROM media_categories mc
+       LEFT JOIN media_assets ma ON ma.category_id=mc.id
+      WHERE mc.workspace_id=$1
+      GROUP BY mc.id
+      ORDER BY lower(mc.name)`, [ws]
+  );
+  res.json({ items:rows });
+}));
+
+app.post('/api/media/categories', auth, allow('MASTER_ADMIN','WORKSPACE_ADMIN','TEAM_ADMIN'), asyncRoute(async (req,res) => {
+  const input = z.object({ workspaceId:z.string().uuid().optional(), name:z.string().trim().min(1).max(100), description:z.string().max(1000).optional().default('') }).parse(req.body);
+  const ws = workspaceScope(req,input.workspaceId);
+  if (!ws) return res.status(400).json({ error:'workspaceId is required' });
+  const { rows:[item] } = await pool.query(
+    `INSERT INTO media_categories(workspace_id,name,description,created_by) VALUES($1,$2,$3,$4) RETURNING *`,
+    [ws,input.name,input.description||null,req.user.id]
+  );
+  await audit(req,'media.category.create','media_category',item.id,{workspaceId:ws,name:item.name});
+  res.status(201).json({ item });
+}));
+
+app.delete('/api/media/categories/:categoryId', auth, allow('MASTER_ADMIN','WORKSPACE_ADMIN','TEAM_ADMIN'), asyncRoute(async (req,res) => {
+  const { rows:[category] } = await pool.query('SELECT * FROM media_categories WHERE id=$1',[req.params.categoryId]);
+  if (!category) return res.status(404).json({ error:'Media category not found' });
+  if (req.user.role !== 'MASTER_ADMIN' && String(req.user.workspace_id)!==String(category.workspace_id)) return res.status(403).json({ error:'Cross-workspace media access denied' });
+  await pool.query('DELETE FROM media_categories WHERE id=$1',[category.id]);
+  await audit(req,'media.category.delete','media_category',category.id,{name:category.name});
+  res.json({ok:true});
+}));
+
+app.get('/api/media/categories/:categoryId/assets', auth, asyncRoute(async (req,res) => {
+  const { rows:[category] } = await pool.query('SELECT * FROM media_categories WHERE id=$1',[req.params.categoryId]);
+  if (!category) return res.status(404).json({ error:'Media category not found' });
+  if (req.user.role !== 'MASTER_ADMIN' && String(req.user.workspace_id)!==String(category.workspace_id)) return res.status(403).json({ error:'Cross-workspace media access denied' });
+  const { rows } = await pool.query(
+    `SELECT id,workspace_id,category_id,filename,mime_type,byte_size,created_at FROM media_assets WHERE category_id=$1 ORDER BY created_at ASC,id ASC`,
+    [category.id]
+  );
+  res.json({ category:{id:category.id,name:category.name,description:category.description}, items:rows });
+}));
+
+app.post('/api/media/categories/:categoryId/assets', auth, allow('MASTER_ADMIN','WORKSPACE_ADMIN','TEAM_ADMIN'), asyncRoute(async (req,res) => {
+  const input = z.object({ filename:z.string().trim().min(1).max(255), mimeType:z.string().trim().min(1).max(120), dataBase64:z.string().min(8) }).parse(req.body);
+  const { rows:[category] } = await pool.query('SELECT * FROM media_categories WHERE id=$1',[req.params.categoryId]);
+  if (!category) return res.status(404).json({ error:'Media category not found' });
+  if (req.user.role !== 'MASTER_ADMIN' && String(req.user.workspace_id)!==String(category.workspace_id)) return res.status(403).json({ error:'Cross-workspace media access denied' });
+  if (!input.mimeType.startsWith('image/')) return res.status(400).json({ error:'Media Database categories currently accept images only' });
+  const buffer=decodeBase64Upload(input.dataBase64);
+  const { rows:[item] }=await pool.query(
+    `INSERT INTO media_assets(workspace_id,category_id,filename,mime_type,byte_size,file_data,created_by)
+     VALUES($1,$2,$3,$4,$5,$6,$7)
+     RETURNING id,workspace_id,category_id,filename,mime_type,byte_size,created_at`,
+    [category.workspace_id,category.id,input.filename,input.mimeType,buffer.length,buffer,req.user.id]
+  );
+  await audit(req,'media.asset.upload','media_asset',item.id,{categoryId:category.id,filename:item.filename,size:item.byte_size});
+  res.status(201).json({item});
+}));
+
+app.delete('/api/media/assets/:assetId', auth, allow('MASTER_ADMIN','WORKSPACE_ADMIN','TEAM_ADMIN'), asyncRoute(async (req,res) => {
+  const { rows:[asset] }=await pool.query('SELECT id,workspace_id,category_id,filename FROM media_assets WHERE id=$1',[req.params.assetId]);
+  if (!asset) return res.status(404).json({error:'Media asset not found'});
+  if (req.user.role !== 'MASTER_ADMIN' && String(req.user.workspace_id)!==String(asset.workspace_id)) return res.status(403).json({ error:'Cross-workspace media access denied' });
+  await pool.query('DELETE FROM media_assets WHERE id=$1',[asset.id]);
+  await audit(req,'media.asset.delete','media_asset',asset.id,{filename:asset.filename,categoryId:asset.category_id});
+  res.json({ok:true});
+}));
+
+app.post('/api/conversations/:conversationId/media-assets/:assetId/send', auth, asyncRoute(async (req,res) => {
+  const conversation=await getConversationForUser(req,req.params.conversationId,true);
+  if (!conversation) return res.status(403).json({error:'You do not have reply permission for this conversation'});
+  if (conversation.status==='waiting'||!conversation.assigned_user_id) return res.status(409).json({error:'Assign the waiting conversation before sending media'});
+  if (['resolved','deleted'].includes(conversation.status)) return res.status(409).json({error:'History conversations are read-only'});
+  const { rows:[asset] }=await pool.query('SELECT * FROM media_assets WHERE id=$1',[req.params.assetId]);
+  if (!asset || String(asset.workspace_id)!==String(conversation.workspace_id)) return res.status(404).json({error:'Media asset not found in this workspace'});
+  const saved=await saveOutboundTelegramMedia(conversation,req.user.id,asset.file_data,asset.filename,asset.mime_type,'image',{source:'media_database',assetId:asset.id,categoryId:asset.category_id});
+  await audit(req,'media.asset.send','conversation',conversation.id,{assetId:asset.id,categoryId:asset.category_id,filename:asset.filename});
+  res.status(201).json({item:saved});
+}));
+
+// ---- Quick replies and automatic messages --------------------------------------------
+app.get('/api/quick-messages', auth, asyncRoute(async (req,res) => {
+  const ws=workspaceScope(req,req.query.workspaceId);
+  if (!ws) return res.json({quickReplies:[],automations:[]});
+  if (req.user.role !== 'MASTER_ADMIN' && String(req.user.workspace_id)!==String(ws)) return res.status(403).json({error:'Cross-workspace quick message access denied'});
+  const { rows:quickReplies }=await pool.query(`SELECT id,workspace_id,title,body,sort_order,enabled,created_at,updated_at FROM quick_replies WHERE workspace_id=$1 ORDER BY sort_order,created_at`,[ws]);
+  const { rows:autoRows }=await pool.query(`SELECT workspace_id,trigger_type,enabled,body,updated_at FROM automation_messages WHERE workspace_id=$1`,[ws]);
+  const byType=Object.fromEntries(autoRows.map(x=>[x.trigger_type,x]));
+  const automations=['new_customer','assigned'].map(triggerType=>byType[triggerType]||{workspace_id:ws,trigger_type:triggerType,enabled:false,body:triggerType==='new_customer'?'Hello! Thanks for contacting us. An agent will assist you shortly.':'Your chat has been assigned. I will assist you from here.'});
+  res.json({quickReplies,automations});
+}));
+
+app.put('/api/automation-messages/:triggerType', auth, allow('MASTER_ADMIN','WORKSPACE_ADMIN','TEAM_ADMIN'), asyncRoute(async (req,res) => {
+  const triggerType=String(req.params.triggerType);
+  if (!['new_customer','assigned'].includes(triggerType)) return res.status(400).json({error:'Invalid automation trigger'});
+  const input=z.object({workspaceId:z.string().uuid().optional(),enabled:z.boolean(),body:z.string().max(4096)}).parse(req.body);
+  const ws=workspaceScope(req,input.workspaceId);
+  if (!ws) return res.status(400).json({error:'workspaceId is required'});
+  const { rows:[item] }=await pool.query(
+    `INSERT INTO automation_messages(workspace_id,trigger_type,enabled,body,updated_by)
+     VALUES($1,$2,$3,$4,$5)
+     ON CONFLICT(workspace_id,trigger_type) DO UPDATE SET enabled=excluded.enabled,body=excluded.body,updated_by=excluded.updated_by,updated_at=now()
+     RETURNING workspace_id,trigger_type,enabled,body,updated_at`,
+    [ws,triggerType,input.enabled,input.body.trim(),req.user.id]
+  );
+  await audit(req,'automation_message.update','automation_message',triggerType,{workspaceId:ws,enabled:input.enabled});
+  res.json({item});
+}));
+
+app.post('/api/quick-replies', auth, allow('MASTER_ADMIN','WORKSPACE_ADMIN','TEAM_ADMIN'), asyncRoute(async (req,res) => {
+  const input=z.object({workspaceId:z.string().uuid().optional(),title:z.string().trim().min(1).max(80),body:z.string().trim().min(1).max(4096)}).parse(req.body);
+  const ws=workspaceScope(req,input.workspaceId);
+  if (!ws) return res.status(400).json({error:'workspaceId is required'});
+  const { rows:[item] }=await pool.query(`INSERT INTO quick_replies(workspace_id,title,body,created_by) VALUES($1,$2,$3,$4) RETURNING *`,[ws,input.title,input.body,req.user.id]);
+  await audit(req,'quick_reply.create','quick_reply',item.id,{workspaceId:ws,title:item.title});
+  res.status(201).json({item});
+}));
+
+app.put('/api/quick-replies/:replyId', auth, allow('MASTER_ADMIN','WORKSPACE_ADMIN','TEAM_ADMIN'), asyncRoute(async (req,res) => {
+  const input=z.object({title:z.string().trim().min(1).max(80),body:z.string().trim().min(1).max(4096),enabled:z.boolean().optional().default(true)}).parse(req.body);
+  const { rows:[existing] }=await pool.query('SELECT * FROM quick_replies WHERE id=$1',[req.params.replyId]);
+  if (!existing) return res.status(404).json({error:'Quick reply not found'});
+  if (req.user.role !== 'MASTER_ADMIN' && String(req.user.workspace_id)!==String(existing.workspace_id)) return res.status(403).json({error:'Cross-workspace quick message access denied'});
+  const { rows:[item] }=await pool.query(`UPDATE quick_replies SET title=$2,body=$3,enabled=$4,updated_at=now() WHERE id=$1 RETURNING *`,[existing.id,input.title,input.body,input.enabled]);
+  await audit(req,'quick_reply.update','quick_reply',item.id,{title:item.title,enabled:item.enabled});
+  res.json({item});
+}));
+
+app.delete('/api/quick-replies/:replyId', auth, allow('MASTER_ADMIN','WORKSPACE_ADMIN','TEAM_ADMIN'), asyncRoute(async (req,res) => {
+  const { rows:[existing] }=await pool.query('SELECT * FROM quick_replies WHERE id=$1',[req.params.replyId]);
+  if (!existing) return res.status(404).json({error:'Quick reply not found'});
+  if (req.user.role !== 'MASTER_ADMIN' && String(req.user.workspace_id)!==String(existing.workspace_id)) return res.status(403).json({error:'Cross-workspace quick message access denied'});
+  await pool.query('DELETE FROM quick_replies WHERE id=$1',[existing.id]);
+  await audit(req,'quick_reply.delete','quick_reply',existing.id,{title:existing.title});
+  res.json({ok:true});
+}));
+
 app.get('/api/audit', auth, allow('MASTER_ADMIN','WORKSPACE_ADMIN'), asyncRoute(async (req,res) => {
   const ws = workspaceScope(req, req.query.workspaceId);
   const params = [];
@@ -992,12 +1459,41 @@ async function runDataMigrations() {
   }
 }
 
+async function runV4DataMigrations() {
+  const migrationKey = 'v4-queue-dashboard-lifecycle';
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [migrationKey]);
+    const { rows:[done] } = await client.query('SELECT migration_key FROM system_migrations WHERE migration_key=$1', [migrationKey]);
+    if (!done) {
+      await client.query(`UPDATE conversations SET assigned_at=COALESCE(assigned_at,updated_at,created_at) WHERE assigned_user_id IS NOT NULL AND assigned_at IS NULL`);
+      await client.query(`UPDATE conversations SET resolved_at=COALESCE(resolved_at,updated_at) WHERE status='resolved' AND resolved_at IS NULL`);
+      await client.query(`UPDATE conversations SET waiting_since=COALESCE(waiting_since,created_at) WHERE status='waiting' AND waiting_since IS NULL`);
+      await client.query(
+        `INSERT INTO conversation_assignment_events(workspace_id,conversation_id,assigned_user_id,assigned_by,created_at)
+         SELECT c.workspace_id,c.id,c.assigned_user_id,c.assigned_user_id,COALESCE(c.assigned_at,c.updated_at,c.created_at)
+           FROM conversations c
+          WHERE c.assigned_user_id IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM conversation_assignment_events ae WHERE ae.conversation_id=c.id)
+         ON CONFLICT DO NOTHING`
+      );
+      await client.query('INSERT INTO system_migrations(migration_key) VALUES($1) ON CONFLICT DO NOTHING', [migrationKey]);
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally { client.release(); }
+}
+
 async function initializeDatabase() {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not configured');
   const schemaPath = path.join(__dirname, 'sql', 'schema.sql');
   const schema = fs.readFileSync(schemaPath, 'utf8');
   await pool.query(schema);
   await runDataMigrations();
+  await runV4DataMigrations();
   console.log('Database schema is ready');
 }
 
@@ -1025,6 +1521,7 @@ app.use((err,req,res,next) => {
   if (err instanceof z.ZodError) return res.status(400).json({ error:'Invalid request', issues:err.issues });
   if (err.code === '23505') return res.status(409).json({ error:'A unique value already exists' });
   if (err.code === 'TELEGRAM_API_ERROR') return res.status(502).json({ error:err.message });
+  if (err.code === 'UPLOAD_TOO_LARGE') return res.status(413).json({ error:err.message });
   if (err.code === 'TRANSLATION_NOT_CONFIGURED') return res.status(503).json({ error:err.message, code:err.code });
   if (err.code === 'TRANSLATION_API_ERROR') return res.status(502).json({ error:err.message, code:err.code });
   res.status(500).json({ error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message });
@@ -1033,6 +1530,6 @@ app.use((err,req,res,next) => {
 module.exports = app;
 if (!process.env.VERCEL && require.main === module) {
   ensureReady()
-    .then(() => app.listen(PORT, () => console.log(`OrbitDesk running on :${PORT}`)))
+    .then(() => app.listen(PORT, () => console.log(`DLXN17 Customer Support running on :${PORT}`)))
     .catch(err => { console.error('Startup failed:', err.message); process.exitCode = 1; });
 }
