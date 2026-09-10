@@ -867,107 +867,206 @@ app.get('/api/inbox/counts', auth, asyncRoute(async (req,res) => {
 app.get('/api/dashboard', auth, asyncRoute(async (req,res) => {
   const requestedWs = String(req.query.workspaceId || '').trim() || null;
   const ws = req.user.role === 'MASTER_ADMIN' ? requestedWs : req.user.workspace_id;
-  if (req.user.role !== 'MASTER_ADMIN' && requestedWs && String(requestedWs)!==String(req.user.workspace_id)) return res.status(403).json({error:'Cross-workspace dashboard access denied'});
+  if (req.user.role !== 'MASTER_ADMIN' && requestedWs && String(requestedWs)!==String(req.user.workspace_id)) {
+    return res.status(403).json({error:'Cross-workspace dashboard access denied'});
+  }
+
   const period = ['today','week','month'].includes(String(req.query.period)) ? String(req.query.period) : 'today';
   const start = dashboardPeriodStart(period);
-  const allScope = ['MASTER_ADMIN','WORKSPACE_ADMIN'].includes(req.user.role);
-  const scopeIds = allScope ? [] : await branchUserIds(req, req.user.workspace_id);
-  const scopeParam = scopeIds.length ? scopeIds : [req.user.id];
-  const common = [ws, start, scopeParam, allScope];
+  const unrestricted = ['MASTER_ADMIN','WORKSPACE_ADMIN'].includes(req.user.role);
+  const scopeIds = unrestricted ? [] : await branchUserIds(req, req.user.workspace_id);
+  const ids = scopeIds.length ? scopeIds : [req.user.id];
 
-  const {rows:[received]} = await pool.query(
-    `SELECT count(DISTINCT c.customer_id)::int AS customers, count(DISTINCT c.id)::int AS conversations
+  // Keep dashboard analytics deliberately dependent only on the long-lived core tables.
+  // This makes the dashboard survive incremental schema upgrades on serverless deployments.
+  // More precise lifecycle/event analytics can still be added later without making the whole
+  // dashboard fail when one optional analytics table/column is unavailable.
+  const params = [ws, start, ids];
+  const wsSql = `($1::uuid IS NULL OR c.workspace_id=$1)`;
+  const ownedSql = unrestricted ? '' : `AND c.assigned_user_id = ANY($3::varchar[])`;
+
+  const safeOne = async (sql, p=params, fallback={}) => {
+    try {
+      const {rows:[row]} = await pool.query(sql,p);
+      return row || fallback;
+    } catch (err) {
+      console.error('Dashboard metric query failed:', err.message);
+      return fallback;
+    }
+  };
+
+  const received = await safeOne(
+    `SELECT count(DISTINCT c.customer_id)::int AS customers
        FROM conversations c
-       JOIN messages m ON m.conversation_id=c.id AND m.sender_type='customer' AND m.created_at >= $2
-      WHERE ($1::uuid IS NULL OR c.workspace_id=$1)
-        AND ($4::boolean OR c.assigned_user_id = ANY($3::varchar[]) OR EXISTS (
-          SELECT 1 FROM conversation_assignment_events ae WHERE ae.conversation_id=c.id AND ae.assigned_user_id = ANY($3::varchar[])
-        ))`, common
-  );
-  const {rows:[assigned]} = await pool.query(
-    `SELECT count(DISTINCT ae.conversation_id)::int AS n
-       FROM conversation_assignment_events ae
-      WHERE ae.created_at >= $2 AND ($1::uuid IS NULL OR ae.workspace_id=$1)
-        AND ($4::boolean OR ae.assigned_user_id = ANY($3::varchar[]))`, common
-  );
-  const {rows:[deleted]} = await pool.query(
-    `SELECT count(DISTINCT c.id)::int AS n FROM conversations c
-      WHERE c.deleted_at >= $2 AND ($1::uuid IS NULL OR c.workspace_id=$1)
-        AND ($4::boolean OR c.deleted_by = ANY($3::varchar[]) OR c.assigned_user_id = ANY($3::varchar[]) OR EXISTS (
-          SELECT 1 FROM conversation_assignment_events ae WHERE ae.conversation_id=c.id AND ae.assigned_user_id = ANY($3::varchar[])
-        ))`, common
-  );
-  const {rows:[resolved]} = await pool.query(
-    `SELECT count(DISTINCT c.id)::int AS n FROM conversations c
-      WHERE c.resolved_at >= $2 AND ($1::uuid IS NULL OR c.workspace_id=$1)
-        AND ($4::boolean OR c.assigned_user_id = ANY($3::varchar[]) OR EXISTS (
-          SELECT 1 FROM conversation_assignment_events ae WHERE ae.conversation_id=c.id AND ae.assigned_user_id = ANY($3::varchar[])
-        ))`, common
-  );
-  const {rows:[active]} = await pool.query(
-    `SELECT count(*)::int AS n FROM conversations c
-      WHERE c.status='in_progress' AND ($1::uuid IS NULL OR c.workspace_id=$1)
-        AND ($4::boolean OR c.assigned_user_id = ANY($3::varchar[]))`, common
-  );
-  const {rows:[totalCustomers]} = await pool.query(
-    `SELECT count(DISTINCT c.customer_id)::int AS n FROM conversations c
-      WHERE ($1::uuid IS NULL OR c.workspace_id=$1)
-        AND ($4::boolean OR c.assigned_user_id = ANY($3::varchar[]) OR EXISTS (
-          SELECT 1 FROM conversation_assignment_events ae WHERE ae.conversation_id=c.id AND ae.assigned_user_id = ANY($3::varchar[])
-        ))`, common
+      WHERE ${wsSql} ${ownedSql}
+        AND EXISTS (
+          SELECT 1 FROM messages m
+           WHERE m.conversation_id=c.id
+             AND m.sender_type='customer'
+             AND m.created_at >= $2
+        )`,
+    params,{customers:0}
   );
 
-  let waitingParams, waitingSql;
-  if (allScope) {
-    waitingParams=[ws];
-    waitingSql=`SELECT count(*)::int AS n,
-      COALESCE(EXTRACT(EPOCH FROM (now()-min(COALESCE(c.waiting_since,c.created_at))))::int,0) AS oldest_seconds
-      FROM conversations c WHERE c.status='waiting' AND ($1::uuid IS NULL OR c.workspace_id=$1)`;
+  const assigned = await safeOne(
+    `SELECT count(DISTINCT c.id)::int AS n
+       FROM conversations c
+      WHERE ${wsSql}
+        AND c.assigned_user_id IS NOT NULL
+        ${unrestricted ? '' : `AND c.assigned_user_id = ANY($3::varchar[])`}
+        AND c.updated_at >= $2`,
+    params,{n:0}
+  );
+
+  const deleted = await safeOne(
+    `SELECT count(DISTINCT c.id)::int AS n
+       FROM conversations c
+      WHERE ${wsSql}
+        AND c.status='deleted'
+        ${ownedSql}
+        AND c.updated_at >= $2`,
+    params,{n:0}
+  );
+
+  const resolved = await safeOne(
+    `SELECT count(DISTINCT c.id)::int AS n
+       FROM conversations c
+      WHERE ${wsSql}
+        AND c.status='resolved'
+        ${ownedSql}
+        AND c.updated_at >= $2`,
+    params,{n:0}
+  );
+
+  const active = await safeOne(
+    `SELECT count(*)::int AS n
+       FROM conversations c
+      WHERE ${wsSql}
+        AND c.status='in_progress'
+        ${ownedSql}`,
+    params,{n:0}
+  );
+
+  let totalCustomers;
+  if (unrestricted) {
+    totalCustomers = await safeOne(
+      `SELECT count(*)::int AS n FROM customers cu WHERE ($1::uuid IS NULL OR cu.workspace_id=$1)`,
+      [ws],{n:0}
+    );
   } else {
-    waitingParams=[req.user.workspace_id,req.user.id];
-    waitingSql=`SELECT count(*)::int AS n,
-      COALESCE(EXTRACT(EPOCH FROM (now()-min(COALESCE(c.waiting_since,c.created_at))))::int,0) AS oldest_seconds
-      FROM conversations c JOIN bot_assignments ba ON ba.bot_id=c.bot_id AND ba.user_id=$2 AND ba.can_read=true
-      WHERE c.status='waiting' AND c.assigned_user_id IS NULL AND c.workspace_id=$1`;
+    totalCustomers = await safeOne(
+      `SELECT count(DISTINCT c.customer_id)::int AS n
+         FROM conversations c
+        WHERE ${wsSql} AND c.assigned_user_id = ANY($3::varchar[])`,
+      params,{n:0}
+    );
   }
-  const {rows:[waiting]}=await pool.query(waitingSql,waitingParams);
 
-  const userWhere=[]; const userParams=[];
-  if (ws) { userParams.push(ws); userWhere.push(`u.workspace_id=$${userParams.length}`); }
-  if (!allScope) { userParams.push(scopeParam); userWhere.push(`u.id = ANY($${userParams.length}::varchar[])`); }
-  userParams.push(start); const startParam=userParams.length;
-  const {rows:team}=await pool.query(
-    `SELECT u.id,u.name,u.role,
-      (SELECT count(*)::int FROM conversations c WHERE c.assigned_user_id=u.id AND c.status='in_progress') AS active_now,
-      (SELECT count(DISTINCT ae.conversation_id)::int FROM conversation_assignment_events ae WHERE ae.assigned_user_id=u.id AND ae.created_at >= $${startParam}) AS assigned_period,
-      (SELECT count(*)::int FROM conversations c WHERE c.deleted_by=u.id AND c.deleted_at >= $${startParam}) AS deleted_period,
-      (SELECT count(*)::int FROM messages m WHERE m.sender_user_id=u.id AND m.sender_type='agent' AND m.created_at >= $${startParam} AND m.deleted_at IS NULL) AS replies_period
-     FROM users u
-     WHERE u.status='active' AND u.role IN ('WORKSPACE_ADMIN','TEAM_ADMIN','AGENT') ${userWhere.length?'AND '+userWhere.join(' AND '):''}
-     ORDER BY CASE u.role WHEN 'WORKSPACE_ADMIN' THEN 1 WHEN 'TEAM_ADMIN' THEN 2 ELSE 3 END,u.name
-     LIMIT 100`, userParams
-  );
+  let waiting;
+  if (unrestricted) {
+    waiting = await safeOne(
+      `SELECT count(*)::int AS n,
+              COALESCE(EXTRACT(EPOCH FROM (now()-min(c.created_at)))::int,0) AS oldest_seconds
+         FROM conversations c
+        WHERE c.status='waiting' AND ${wsSql}`,
+      params,{n:0,oldest_seconds:0}
+    );
+  } else {
+    waiting = await safeOne(
+      `SELECT count(DISTINCT c.id)::int AS n,
+              COALESCE(EXTRACT(EPOCH FROM (now()-min(c.created_at)))::int,0) AS oldest_seconds
+         FROM conversations c
+        WHERE c.status='waiting'
+          AND c.assigned_user_id IS NULL
+          AND ${wsSql}
+          AND EXISTS (
+            SELECT 1 FROM bot_assignments ba
+             WHERE ba.bot_id=c.bot_id
+               AND ba.user_id = ANY($3::varchar[])
+               AND ba.can_read=true
+          )`,
+      params,{n:0,oldest_seconds:0}
+    );
+  }
 
-  const {rows:[avgResponse]} = await pool.query(
+  const avgResponse = await safeOne(
     `WITH scoped AS (
-       SELECT c.id FROM conversations c
-       WHERE ($1::uuid IS NULL OR c.workspace_id=$1)
-         AND ($4::boolean OR c.assigned_user_id = ANY($3::varchar[]) OR EXISTS (
-           SELECT 1 FROM conversation_assignment_events ae WHERE ae.conversation_id=c.id AND ae.assigned_user_id = ANY($3::varchar[])
-         ))
-     ), pairs AS (
+       SELECT c.id
+         FROM conversations c
+        WHERE ${wsSql} ${ownedSql}
+     ), firsts AS (
        SELECT s.id,
-         (SELECT min(m.created_at) FROM messages m WHERE m.conversation_id=s.id AND m.sender_type='customer' AND m.created_at >= $2) first_customer,
-         (SELECT min(m.created_at) FROM messages m WHERE m.conversation_id=s.id AND m.sender_type IN ('agent','bot') AND m.created_at >= $2) first_reply
-       FROM scoped s
+              (SELECT min(m.created_at) FROM messages m WHERE m.conversation_id=s.id AND m.sender_type='customer' AND m.created_at >= $2) AS first_customer,
+              (SELECT min(m.created_at) FROM messages m WHERE m.conversation_id=s.id AND m.sender_type IN ('agent','bot') AND m.created_at >= $2) AS first_reply
+         FROM scoped s
      )
-     SELECT COALESCE(avg(EXTRACT(EPOCH FROM (first_reply-first_customer))) FILTER (WHERE first_customer IS NOT NULL AND first_reply>=first_customer),0)::int AS seconds FROM pairs`, common
+     SELECT COALESCE(avg(EXTRACT(EPOCH FROM (first_reply-first_customer)))
+              FILTER (WHERE first_customer IS NOT NULL AND first_reply>=first_customer),0)::int AS seconds
+       FROM firsts`,
+    params,{seconds:0}
   );
+
+  let team=[];
+  try {
+    const userParams=[];
+    const where=[`u.status='active'`,`u.role IN ('WORKSPACE_ADMIN','TEAM_ADMIN','AGENT')`];
+    if (ws) { userParams.push(ws); where.push(`u.workspace_id=$${userParams.length}`); }
+    if (!unrestricted) { userParams.push(ids); where.push(`u.id = ANY($${userParams.length}::varchar[])`); }
+    userParams.push(start); const sp=userParams.length;
+    const {rows}=await pool.query(
+      `SELECT u.id,u.name,u.role,
+              (SELECT count(*)::int FROM conversations c WHERE c.assigned_user_id=u.id AND c.status='in_progress') AS active_now,
+              (SELECT count(*)::int FROM conversations c WHERE c.assigned_user_id=u.id AND c.updated_at >= $${sp}) AS assigned_period,
+              (SELECT count(*)::int FROM conversations c WHERE c.assigned_user_id=u.id AND c.status='deleted' AND c.updated_at >= $${sp}) AS deleted_period,
+              (SELECT count(*)::int FROM messages m WHERE m.sender_user_id=u.id AND m.sender_type='agent' AND m.created_at >= $${sp} AND m.deleted_at IS NULL) AS replies_period
+         FROM users u
+        WHERE ${where.join(' AND ')}
+        ORDER BY CASE u.role WHEN 'WORKSPACE_ADMIN' THEN 1 WHEN 'TEAM_ADMIN' THEN 2 ELSE 3 END,u.name
+        LIMIT 100`, userParams
+    );
+    team=rows;
+  } catch (err) {
+    console.error('Dashboard team query failed:', err.message);
+    // Compatibility fallback for databases that predate message soft-delete columns.
+    try {
+      const userParams=[];
+      const where=[`u.status='active'`,`u.role IN ('WORKSPACE_ADMIN','TEAM_ADMIN','AGENT')`];
+      if (ws) { userParams.push(ws); where.push(`u.workspace_id=$${userParams.length}`); }
+      if (!unrestricted) { userParams.push(ids); where.push(`u.id = ANY($${userParams.length}::varchar[])`); }
+      userParams.push(start); const sp=userParams.length;
+      const {rows}=await pool.query(
+        `SELECT u.id,u.name,u.role,
+                (SELECT count(*)::int FROM conversations c WHERE c.assigned_user_id=u.id AND c.status='in_progress') AS active_now,
+                (SELECT count(*)::int FROM conversations c WHERE c.assigned_user_id=u.id AND c.updated_at >= $${sp}) AS assigned_period,
+                (SELECT count(*)::int FROM conversations c WHERE c.assigned_user_id=u.id AND c.status='deleted' AND c.updated_at >= $${sp}) AS deleted_period,
+                (SELECT count(*)::int FROM messages m WHERE m.sender_user_id=u.id AND m.sender_type='agent' AND m.created_at >= $${sp}) AS replies_period
+           FROM users u
+          WHERE ${where.join(' AND ')}
+          ORDER BY CASE u.role WHEN 'WORKSPACE_ADMIN' THEN 1 WHEN 'TEAM_ADMIN' THEN 2 ELSE 3 END,u.name
+          LIMIT 100`, userParams
+      );
+      team=rows;
+    } catch (fallbackErr) {
+      console.error('Dashboard team fallback failed:', fallbackErr.message);
+      team=[];
+    }
+  }
 
   res.json({
-    period, periodStart:start.toISOString(),
-    scope: req.user.role==='MASTER_ADMIN'?(ws?'workspace':'all_workspaces'):req.user.role==='WORKSPACE_ADMIN'?'workspace':req.user.role==='TEAM_ADMIN'?'team':'self',
-    metrics:{received:Number(received.customers||0),assigned:Number(assigned.n||0),deleted:Number(deleted.n||0),resolved:Number(resolved.n||0),inProgress:Number(active.n||0),waiting:Number(waiting.n||0),totalCustomers:Number(totalCustomers.n||0),avgFirstResponseSeconds:Number(avgResponse.seconds||0),oldestWaitingSeconds:Number(waiting.oldest_seconds||0)},
+    period,
+    periodStart:start.toISOString(),
+    scope:req.user.role==='MASTER_ADMIN'?(ws?'workspace':'all_workspaces'):req.user.role==='WORKSPACE_ADMIN'?'workspace':req.user.role==='TEAM_ADMIN'?'team':'self',
+    metrics:{
+      received:Number(received.customers||0),
+      assigned:Number(assigned.n||0),
+      deleted:Number(deleted.n||0),
+      resolved:Number(resolved.n||0),
+      inProgress:Number(active.n||0),
+      waiting:Number(waiting.n||0),
+      totalCustomers:Number(totalCustomers.n||0),
+      avgFirstResponseSeconds:Number(avgResponse.seconds||0),
+      oldestWaitingSeconds:Number(waiting.oldest_seconds||0)
+    },
     team
   });
 }));
