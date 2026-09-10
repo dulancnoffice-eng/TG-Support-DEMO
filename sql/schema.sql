@@ -240,3 +240,17 @@ CREATE TABLE IF NOT EXISTS automation_messages (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY(workspace_id, trigger_type)
 );
+
+
+-- DLXN17 V4.2.3: image previews and message reply threading.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_message_id UUID REFERENCES messages(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to_message_id);
+
+CREATE TABLE IF NOT EXISTS message_media_blobs (
+  message_id UUID PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+  filename VARCHAR(255),
+  mime_type VARCHAR(120) NOT NULL,
+  byte_size INT NOT NULL CHECK (byte_size > 0),
+  file_data BYTEA NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
