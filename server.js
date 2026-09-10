@@ -94,6 +94,35 @@ async function telegramApi(token, method, payload = {}) {
   }
   return data.result;
 }
+
+async function translateText(text, targetLanguage) {
+  const key = String(process.env.GOOGLE_TRANSLATE_API_KEY || '').trim();
+  if (!key) {
+    const err = new Error('Translation is not configured. Add GOOGLE_TRANSLATE_API_KEY in Vercel Environment Variables.');
+    err.code = 'TRANSLATION_NOT_CONFIGURED';
+    throw err;
+  }
+  const url = new URL('https://translation.googleapis.com/language/translate/v2');
+  url.searchParams.set('key', key);
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({ q: text, target: targetLanguage, format: 'text' }),
+    signal: AbortSignal.timeout(15_000)
+  });
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data?.data?.translations?.[0]) {
+    const err = new Error(data?.error?.message || `Translation failed (${response.status})`);
+    err.code = 'TRANSLATION_API_ERROR';
+    throw err;
+  }
+  const item = data.data.translations[0];
+  return {
+    text: String(item.translatedText || ''),
+    detectedSourceLanguage: item.detectedSourceLanguage || null,
+    provider: 'google'
+  };
+}
 async function audit(req, action, entityType, entityId, details = {}) {
   try {
     await pool.query(
@@ -566,17 +595,26 @@ app.post('/api/telegram/webhook/:botId', asyncRoute(async (req,res) => {
 
   let { rows:[conversation] } = await pool.query(
     `SELECT * FROM conversations
-      WHERE workspace_id=$1 AND bot_id=$2 AND customer_id=$3 AND status <> 'resolved'
-      ORDER BY created_at DESC LIMIT 1`,
+      WHERE workspace_id=$1 AND bot_id=$2 AND customer_id=$3
+      ORDER BY created_at ASC LIMIT 1`,
     [bot.workspace_id,bot.id,customer.id]
   );
   if (!conversation) {
-    const created = await pool.query(
-      `INSERT INTO conversations(workspace_id,bot_id,customer_id,status,unread_count,last_message_at)
-       VALUES($1,$2,$3,'waiting',0,now()) RETURNING *`,
-      [bot.workspace_id,bot.id,customer.id]
-    );
-    conversation = created.rows[0];
+    try {
+      const created = await pool.query(
+        `INSERT INTO conversations(workspace_id,bot_id,customer_id,status,unread_count,last_message_at)
+         VALUES($1,$2,$3,'waiting',0,now()) RETURNING *`,
+        [bot.workspace_id,bot.id,customer.id]
+      );
+      conversation = created.rows[0];
+    } catch (err) {
+      if (err.code !== '23505') throw err;
+      const existing = await pool.query(
+        `SELECT * FROM conversations WHERE workspace_id=$1 AND bot_id=$2 AND customer_id=$3 ORDER BY created_at ASC LIMIT 1`,
+        [bot.workspace_id,bot.id,customer.id]
+      );
+      conversation = existing.rows[0];
+    }
   }
 
   const inserted = await pool.query(
@@ -588,7 +626,12 @@ app.post('/api/telegram/webhook/:botId', asyncRoute(async (req,res) => {
   );
   if (inserted.rowCount) {
     await pool.query(
-      `UPDATE conversations SET unread_count=unread_count+1,last_message_at=to_timestamp($2),updated_at=now() WHERE id=$1`,
+      `UPDATE conversations
+          SET status=CASE WHEN status='resolved' THEN 'waiting' ELSE status END,
+              assigned_user_id=CASE WHEN status='resolved' THEN NULL ELSE assigned_user_id END,
+              unread_count=unread_count+1,
+              last_message_at=to_timestamp($2),updated_at=now()
+        WHERE id=$1`,
       [conversation.id,Number(message.date || Math.floor(Date.now()/1000))]
     );
   }
@@ -628,8 +671,11 @@ app.get('/api/conversations', auth, asyncRoute(async (req,res) => {
   }
   if (status) params.push(status);
   const statusSql = status ? `AND c.status=$${params.length}` : '';
+  const tag = String(req.query.tag || '').trim();
+  if (tag) params.push(tag);
+  const tagSql = tag ? `AND $${params.length}=ANY(cu.tags)` : '';
   const { rows } = await pool.query(
-    `SELECT c.id,c.workspace_id,c.bot_id,c.customer_id,c.assigned_user_id,c.status,c.priority,c.unread_count,c.last_message_at,c.created_at,
+    `SELECT c.id,c.workspace_id,c.bot_id,c.customer_id,c.assigned_user_id,c.status,c.priority,c.unread_count,c.last_message_at,c.created_at,c.remark,c.remark_updated_at,
             cu.display_name,cu.external_user_id,cu.tags,cu.metadata AS customer_metadata,
             b.name AS bot_name,b.external_bot_username,
             au.name AS assigned_name,
@@ -640,7 +686,7 @@ app.get('/api/conversations', auth, asyncRoute(async (req,res) => {
        JOIN bots b ON b.id=c.bot_id
        LEFT JOIN users au ON au.id=c.assigned_user_id
        LEFT JOIN LATERAL (SELECT body FROM messages m WHERE m.conversation_id=c.id ORDER BY m.created_at DESC LIMIT 1) lm ON true
-      WHERE c.workspace_id=$1 ${statusSql}
+      WHERE c.workspace_id=$1 ${statusSql} ${tagSql}
       ORDER BY c.last_message_at DESC NULLS LAST, c.created_at DESC
       LIMIT 300`, params
   );
@@ -651,7 +697,7 @@ app.get('/api/conversations/:conversationId/messages', auth, asyncRoute(async (r
   const conversation = await getConversationForUser(req, req.params.conversationId, false);
   if (!conversation) return res.status(404).json({ error:'Conversation not found in your scope' });
   const { rows } = await pool.query(
-    `SELECT id,sender_type,sender_user_id,body,media,external_message_id,created_at
+    `SELECT id,sender_type,sender_user_id,body,media,external_message_id,created_at,deleted_at,deleted_by,telegram_deleted
        FROM messages WHERE conversation_id=$1 ORDER BY created_at ASC LIMIT 1000`, [conversation.id]
   );
   await pool.query('UPDATE conversations SET unread_count=0 WHERE id=$1', [conversation.id]);
@@ -716,6 +762,137 @@ app.post('/api/conversations/:conversationId/resolve', auth, asyncRoute(async (r
   res.json({ ok:true });
 }));
 
+
+app.get('/api/tags', auth, asyncRoute(async (req,res) => {
+  const ws = workspaceScope(req, req.query.workspaceId);
+  if (!ws) return res.json({ items:[] });
+  if (req.user.role !== 'MASTER_ADMIN' && String(req.user.workspace_id) !== String(ws)) return res.status(403).json({ error:'Cross-workspace tag access denied' });
+  const { rows } = await pool.query(
+    `SELECT wt.id,wt.workspace_id,wt.name,wt.created_at,
+            COALESCE((SELECT count(*)::int FROM customers c WHERE c.workspace_id=wt.workspace_id AND wt.name=ANY(c.tags)),0) AS usage_count
+       FROM workspace_tags wt
+      WHERE wt.workspace_id=$1
+      ORDER BY lower(wt.name)`, [ws]
+  );
+  res.json({ items:rows });
+}));
+
+app.post('/api/tags', auth, allow('MASTER_ADMIN','WORKSPACE_ADMIN','TEAM_ADMIN','AGENT'), asyncRoute(async (req,res) => {
+  const input = z.object({ workspaceId:z.string().uuid().optional(), name:z.string().trim().min(1).max(40) }).parse(req.body);
+  const ws = workspaceScope(req, input.workspaceId);
+  if (!ws) return res.status(400).json({ error:'workspaceId is required' });
+  const inserted = await pool.query(
+    `INSERT INTO workspace_tags(workspace_id,name,created_by)
+     VALUES($1,$2,$3)
+     ON CONFLICT DO NOTHING
+     RETURNING id,workspace_id,name,created_at`,
+    [ws,input.name,req.user.id]
+  );
+  const item = inserted.rows[0] || (await pool.query(
+    `SELECT id,workspace_id,name,created_at FROM workspace_tags WHERE workspace_id=$1 AND lower(name)=lower($2) LIMIT 1`,
+    [ws,input.name]
+  )).rows[0];
+  await audit(req,'tag.create','tag',item.id,{name:item.name});
+  res.status(inserted.rows[0] ? 201 : 200).json({ item });
+}));
+
+app.delete('/api/tags/:tagId', auth, allow('MASTER_ADMIN','WORKSPACE_ADMIN'), asyncRoute(async (req,res) => {
+  const { rows:[tag] } = await pool.query('SELECT * FROM workspace_tags WHERE id=$1', [req.params.tagId]);
+  if (!tag) return res.status(404).json({ error:'Tag not found' });
+  if (req.user.role !== 'MASTER_ADMIN' && String(req.user.workspace_id) !== String(tag.workspace_id)) return res.status(403).json({ error:'Cross-workspace tag access denied' });
+  await pool.query(`UPDATE customers SET tags=array_remove(tags,$2),updated_at=now() WHERE workspace_id=$1`, [tag.workspace_id,tag.name]);
+  await pool.query('DELETE FROM workspace_tags WHERE id=$1', [tag.id]);
+  await audit(req,'tag.delete','tag',tag.id,{name:tag.name});
+  res.json({ ok:true });
+}));
+
+app.put('/api/conversations/:conversationId/tags', auth, asyncRoute(async (req,res) => {
+  const input = z.object({ tags:z.array(z.string().trim().min(1).max(40)).max(30) }).parse(req.body);
+  const conversation = await getConversationForUser(req, req.params.conversationId, false);
+  if (!conversation) return res.status(404).json({ error:'Conversation not found in your scope' });
+  if (req.user.role === 'VIEWER') return res.status(403).json({ error:'Viewer cannot edit tags' });
+  const unique = [...new Set(input.tags.map(x=>x.trim()).filter(Boolean))];
+  if (unique.length) {
+    const { rows } = await pool.query(`SELECT name FROM workspace_tags WHERE workspace_id=$1 AND name = ANY($2::text[])`, [conversation.workspace_id,unique]);
+    if (rows.length !== unique.length) return res.status(400).json({ error:'One or more tags are not defined in this workspace' });
+  }
+  await pool.query(`UPDATE customers SET tags=$2::text[],updated_at=now() WHERE id=$1`, [conversation.customer_id,unique]);
+  await audit(req,'conversation.tags','conversation',conversation.id,{tags:unique});
+  res.json({ ok:true, tags:unique });
+}));
+
+app.put('/api/conversations/:conversationId/remark', auth, asyncRoute(async (req,res) => {
+  const input = z.object({ remark:z.string().max(2000) }).parse(req.body);
+  const conversation = await getConversationForUser(req, req.params.conversationId, false);
+  if (!conversation) return res.status(404).json({ error:'Conversation not found in your scope' });
+  if (req.user.role === 'VIEWER') return res.status(403).json({ error:'Viewer cannot edit remarks' });
+  await pool.query(`UPDATE conversations SET remark=$2,remark_updated_by=$3,remark_updated_at=now(),updated_at=now() WHERE id=$1`, [conversation.id,input.remark.trim(),req.user.id]);
+  await audit(req,'conversation.remark','conversation',conversation.id,{length:input.remark.trim().length});
+  res.json({ ok:true, remark:input.remark.trim() });
+}));
+
+app.post('/api/messages/:messageId/translate', auth, asyncRoute(async (req,res) => {
+  const input = z.object({ targetLanguage:z.enum(['en','zh-CN']) }).parse(req.body);
+  const { rows:[message] } = await pool.query(
+    `SELECT m.id,m.conversation_id,m.body,m.deleted_at
+       FROM messages m WHERE m.id=$1`, [req.params.messageId]
+  );
+  if (!message) return res.status(404).json({ error:'Message not found' });
+  const conversation = await getConversationForUser(req, message.conversation_id, false);
+  if (!conversation) return res.status(404).json({ error:'Message is outside your conversation scope' });
+  if (message.deleted_at || !message.body) return res.status(409).json({ error:'Deleted or empty messages cannot be translated' });
+  const { rows:[cached] } = await pool.query(`SELECT translated_text,detected_source_language,provider FROM message_translations WHERE message_id=$1 AND target_language=$2`, [message.id,input.targetLanguage]);
+  if (cached) return res.json({ ok:true, cached:true, translatedText:cached.translated_text, detectedSourceLanguage:cached.detected_source_language, provider:cached.provider });
+  const translated = await translateText(message.body,input.targetLanguage);
+  await pool.query(
+    `INSERT INTO message_translations(message_id,target_language,translated_text,detected_source_language,provider)
+     VALUES($1,$2,$3,$4,$5)
+     ON CONFLICT(message_id,target_language) DO UPDATE SET translated_text=excluded.translated_text,detected_source_language=excluded.detected_source_language,provider=excluded.provider,created_at=now()`,
+    [message.id,input.targetLanguage,translated.text,translated.detectedSourceLanguage,translated.provider]
+  );
+  res.json({ ok:true, cached:false, translatedText:translated.text, detectedSourceLanguage:translated.detectedSourceLanguage, provider:translated.provider });
+}));
+
+app.delete('/api/messages/:messageId', auth, asyncRoute(async (req,res) => {
+  const { rows:[message] } = await pool.query(
+    `SELECT m.*,c.bot_id,c.workspace_id,c.customer_id,b.token_ciphertext,b.token_iv,b.token_tag,cu.metadata AS customer_metadata
+       FROM messages m
+       JOIN conversations c ON c.id=m.conversation_id
+       JOIN bots b ON b.id=c.bot_id
+       JOIN customers cu ON cu.id=c.customer_id
+      WHERE m.id=$1`, [req.params.messageId]
+  );
+  if (!message) return res.status(404).json({ error:'Message not found' });
+  const conversation = await getConversationForUser(req, message.conversation_id, true);
+  if (!conversation) return res.status(403).json({ error:'You do not have permission to delete this message' });
+  if (message.deleted_at) return res.json({ ok:true, alreadyDeleted:true, remoteDeleted:Boolean(message.telegram_deleted) });
+  const supervisor = ['MASTER_ADMIN','WORKSPACE_ADMIN'].includes(req.user.role);
+  const ownOutbound = message.sender_type !== 'customer' && message.sender_user_id === req.user.id;
+  if (!supervisor && !ownOutbound) return res.status(403).json({ error:'Agents can delete only messages they sent. Workspace/Master Admin can delete any message in scope.' });
+
+  let remoteDeleted=false, remoteError=null;
+  const external = String(message.external_message_id || '');
+  const split = external.lastIndexOf(':');
+  if (split > 0) {
+    const chatId = external.slice(0,split);
+    const messageId = Number(external.slice(split+1));
+    if (chatId && Number.isInteger(messageId)) {
+      try {
+        const bot = { token_ciphertext:message.token_ciphertext, token_iv:message.token_iv, token_tag:message.token_tag };
+        const botToken = decryptToken(bot);
+        remoteDeleted = Boolean(await telegramApi(botToken,'deleteMessage',{chat_id:chatId,message_id:messageId}));
+      } catch (err) {
+        remoteError = err.message;
+      }
+    }
+  }
+  await pool.query(`UPDATE messages SET body=NULL,media=NULL,deleted_at=now(),deleted_by=$2,telegram_deleted=$3 WHERE id=$1`, [message.id,req.user.id,remoteDeleted]);
+  await pool.query('DELETE FROM message_translations WHERE message_id=$1', [message.id]);
+  await pool.query(`UPDATE conversations SET last_message_at=(SELECT max(created_at) FROM messages WHERE conversation_id=$1 AND deleted_at IS NULL),updated_at=now() WHERE id=$1`, [message.conversation_id]);
+  await audit(req,'message.delete','message',message.id,{conversationId:message.conversation_id,remoteDeleted,remoteError});
+  res.json({ ok:true, remoteDeleted, remoteError });
+}));
+
 app.get('/api/customers', auth, asyncRoute(async (req,res) => {
   const ws = workspaceScope(req, req.query.workspaceId);
   if (!ws) return res.json({items:[]});
@@ -746,11 +923,81 @@ app.get('/api/audit', auth, allow('MASTER_ADMIN','WORKSPACE_ADMIN'), asyncRoute(
   res.json({ items: rows });
 }));
 
+async function runDataMigrations() {
+  const migrationKey = 'v3-one-thread-per-bot-customer';
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [migrationKey]);
+    const { rows:[done] } = await client.query('SELECT migration_key FROM system_migrations WHERE migration_key=$1', [migrationKey]);
+    if (!done) {
+      const { rows:groups } = await client.query(
+        `SELECT bot_id,customer_id,count(*)::int AS n
+           FROM conversations
+          WHERE bot_id IS NOT NULL
+          GROUP BY bot_id,customer_id
+         HAVING count(*) > 1`
+      );
+      for (const group of groups) {
+        const { rows:items } = await client.query(
+          `SELECT id,status,assigned_user_id,unread_count,last_message_at,created_at,remark,remark_updated_at
+             FROM conversations
+            WHERE bot_id=$1 AND customer_id=$2
+            ORDER BY created_at ASC FOR UPDATE`,
+          [group.bot_id,group.customer_id]
+        );
+        if (items.length < 2) continue;
+        const canonical = items[0];
+        const latest = items[items.length-1];
+        const duplicates = items.slice(1);
+        let unread = items.reduce((n,x)=>n+Number(x.unread_count||0),0);
+        let lastMessage = items.map(x=>x.last_message_at).filter(Boolean).sort().at(-1) || latest.last_message_at || canonical.last_message_at;
+        const remarkItem = [...items].reverse().find(x=>x.remark);
+        for (const dup of duplicates) {
+          await client.query(
+            `DELETE FROM messages d
+              USING messages k
+             WHERE d.conversation_id=$1 AND k.conversation_id=$2
+               AND d.external_message_id IS NOT NULL
+               AND d.external_message_id=k.external_message_id`,
+            [dup.id,canonical.id]
+          );
+          await client.query('UPDATE messages SET conversation_id=$1 WHERE conversation_id=$2', [canonical.id,dup.id]);
+          await client.query('DELETE FROM conversations WHERE id=$1', [dup.id]);
+        }
+        await client.query(
+          `UPDATE conversations
+              SET status=$2,assigned_user_id=$3,unread_count=$4,last_message_at=$5,
+                  remark=COALESCE($6,remark),remark_updated_at=COALESCE($7,remark_updated_at),updated_at=now()
+            WHERE id=$1`,
+          [canonical.id,latest.status,latest.assigned_user_id,unread,lastMessage,remarkItem?.remark||null,remarkItem?.remark_updated_at||null]
+        );
+      }
+      await client.query(
+        `INSERT INTO workspace_tags(workspace_id,name)
+         SELECT DISTINCT c.workspace_id,t.tag
+           FROM customers c CROSS JOIN LATERAL unnest(c.tags) AS t(tag)
+          WHERE trim(t.tag)<>''
+         ON CONFLICT DO NOTHING`
+      );
+      await client.query('INSERT INTO system_migrations(migration_key) VALUES($1) ON CONFLICT DO NOTHING', [migrationKey]);
+    }
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_conversations_bot_customer ON conversations(bot_id,customer_id) WHERE bot_id IS NOT NULL`);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 async function initializeDatabase() {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not configured');
   const schemaPath = path.join(__dirname, 'sql', 'schema.sql');
   const schema = fs.readFileSync(schemaPath, 'utf8');
   await pool.query(schema);
+  await runDataMigrations();
   console.log('Database schema is ready');
 }
 
@@ -778,6 +1025,8 @@ app.use((err,req,res,next) => {
   if (err instanceof z.ZodError) return res.status(400).json({ error:'Invalid request', issues:err.issues });
   if (err.code === '23505') return res.status(409).json({ error:'A unique value already exists' });
   if (err.code === 'TELEGRAM_API_ERROR') return res.status(502).json({ error:err.message });
+  if (err.code === 'TRANSLATION_NOT_CONFIGURED') return res.status(503).json({ error:err.message, code:err.code });
+  if (err.code === 'TRANSLATION_API_ERROR') return res.status(502).json({ error:err.message, code:err.code });
   res.status(500).json({ error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message });
 });
 
