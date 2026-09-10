@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Telegram Customer Service UI</title>
+<style>
+:root{
+  --nav:#071c2c;
+  --nav2:#0d2b40;
+  --blue:#1677ff;
+  --blue-soft:#eaf3ff;
+  --line:#e8edf2;
+  --text:#17212b;
+  --muted:#8a96a3;
+  --bg:#f7f9fb;
+  --white:#fff;
+  --green:#20b26b;
+  --yellow:#f2a900;
+  --red:#ef5350;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;color:var(--text);background:var(--bg);height:100vh;overflow:hidden}
+button,input{font:inherit}
+.app{height:100vh;display:flex}
+
+/* Left navigation */
+.nav{width:224px;background:var(--nav);color:#fff;display:flex;flex-direction:column}
+.brand{height:64px;display:flex;align-items:center;padding:0 15px;gap:10px;border-bottom:1px solid rgba(255,255,255,.07)}
+.logo{width:32px;height:32px;border-radius:7px;background:#1687e8;display:grid;place-items:center;font-weight:800}
+.brand span{font-weight:650;white-space:nowrap}
+.nav-items{padding:14px 10px}
+.nav-item{height:42px;border-radius:7px;display:flex;align-items:center;gap:12px;padding:0 12px;color:#aebdca;cursor:pointer;font-size:14px}
+.nav-item:hover,.nav-item.active{background:var(--nav2);color:#fff}
+.icon{width:20px;text-align:center;font-size:16px}
+.spacer{flex:1}
+.account{padding:14px 12px;border-top:1px solid rgba(255,255,255,.07)}
+.account-row{display:flex;gap:10px;align-items:center}
+.avatar{width:34px;height:34px;border-radius:50%;background:#1e3548;display:grid;place-items:center}
+.account small{color:#8fa1af}
+.account-actions{display:flex;gap:18px;margin-top:12px;padding-left:44px;color:#aebdca;font-size:12px}
+.account-actions span{cursor:pointer}
+
+/* Session list */
+.sessions{width:290px;background:#fff;border-right:1px solid var(--line);display:flex;flex-direction:column}
+.search{padding:12px 12px 8px}
+.searchbox{height:38px;border:1px solid #d8dee5;border-radius:6px;display:flex;align-items:center;gap:8px;padding:0 11px;color:#9aa5b0}
+.searchbox input{border:0;outline:0;width:100%;font-size:13px}
+.tabs{height:43px;display:flex;border-bottom:1px solid var(--line);padding:0 12px}
+.tab{flex:1;border:0;background:none;color:#4b5560;cursor:pointer;font-size:13px;position:relative}
+.tab.active{color:var(--blue);font-weight:600}
+.tab.active:after{content:"";position:absolute;left:20%;right:20%;bottom:-1px;height:2px;background:var(--blue)}
+.filters{display:flex;align-items:center;gap:9px;padding:9px 12px;border-bottom:1px solid var(--line)}
+.check{width:15px;height:15px}
+.filter-select{height:28px;border:1px solid #dfe4e9;border-radius:5px;background:#fff;color:#a0a8b1;padding:0 7px;font-size:12px}
+.session-list{overflow:auto;flex:1}
+.session{padding:13px 12px;border-bottom:1px solid #f0f2f4;display:flex;gap:10px;cursor:pointer}
+.session:hover,.session.selected{background:#f5f9ff}
+.session-avatar{width:38px;height:38px;border-radius:50%;background:#dceeff;color:#2474b9;display:grid;place-items:center;font-weight:650;flex:none}
+.session-main{min-width:0;flex:1}
+.session-top{display:flex;justify-content:space-between;gap:8px}
+.session-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.session-time{font-size:10px;color:#a2aab2}
+.session-msg{font-size:11px;color:#87919a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:5px}
+.badge{display:inline-flex;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--blue);color:#fff;align-items:center;justify-content:center;font-size:10px}
+
+/* Chat */
+.chat{flex:1;min-width:0;display:flex;flex-direction:column;background:#f5f7f9}
+.empty{flex:1;display:grid;place-items:center;color:#b5bdc4}
+.empty-box{text-align:center}
+.empty-globe{font-size:42px;opacity:.5;margin-bottom:8px}
+.chat-header{height:64px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 18px;justify-content:space-between}
+.contact{display:flex;align-items:center;gap:11px}
+.contact .avatar{background:#dceeff;color:#2872aa}
+.contact-name{font-weight:650;font-size:14px}
+.online{font-size:11px;color:var(--green);margin-top:2px}
+.header-actions{display:flex;gap:7px}
+.hbtn{width:35px;height:35px;border:0;background:#f3f6f8;border-radius:6px;cursor:pointer;color:#64717d}
+.hbtn:hover{background:#e8edf1}
+.messages{flex:1;overflow:auto;padding:24px 8%;display:flex;flex-direction:column;gap:10px}
+.day{text-align:center;font-size:11px;color:#9aa4ad;margin:5px 0 8px}
+.message{max-width:68%;padding:10px 12px;border-radius:9px;box-shadow:0 1px 1px rgba(0,0,0,.04);font-size:13px;line-height:1.45}
+.in{background:#fff;align-self:flex-start;border-top-left-radius:3px}
+.out{background:#dff3e9;align-self:flex-end;border-top-right-radius:3px}
+.meta{font-size:9px;color:#98a1a9;text-align:right;margin-top:4px}
+.composer{background:#fff;border-top:1px solid var(--line);padding:11px 18px}
+.compose-row{display:flex;gap:8px;align-items:end}
+.attach,.send{width:38px;height:38px;border:0;border-radius:6px;cursor:pointer}
+.attach{background:#f0f3f6;color:#66727e}
+.send{background:var(--blue);color:#fff}
+.compose-input{flex:1;min-height:38px;max-height:110px;border:1px solid #dce2e7;border-radius:7px;padding:9px 11px;outline:0;resize:none}
+.compose-input:focus{border-color:#9bc4ff}
+.quick{display:flex;gap:7px;margin-top:7px}
+.quick button{border:1px solid #e1e6eb;background:#fff;border-radius:15px;padding:4px 9px;font-size:10px;color:#66727e;cursor:pointer}
+
+/* Settings drawer */
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.28);display:none;z-index:20}
+.drawer{position:absolute;right:0;top:0;height:100%;width:390px;background:#fff;box-shadow:-8px 0 30px rgba(0,0,0,.12);padding:22px;overflow:auto}
+.overlay.open{display:block}
+.drawer-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:22px}
+.drawer h2{font-size:18px;margin:0}
+.close{border:0;background:#f1f3f5;width:32px;height:32px;border-radius:6px;cursor:pointer}
+.field{margin-bottom:18px}
+.field label{display:block;font-size:12px;font-weight:650;margin-bottom:7px}
+.field input,.field select{width:100%;height:40px;border:1px solid #d8dee5;border-radius:6px;padding:0 10px;outline:0}
+.field input:focus,.field select:focus{border-color:#86b8ff}
+.help{font-size:10px;color:#89949e;margin-top:6px;line-height:1.5}
+.switch-row{display:flex;justify-content:space-between;align-items:center;padding:13px 0;border-top:1px solid var(--line)}
+.switch{width:40px;height:22px;background:#cbd3da;border-radius:20px;padding:2px;cursor:pointer}
+.switch i{display:block;width:18px;height:18px;background:#fff;border-radius:50%;transition:.2s}
+.switch.on{background:var(--blue)}
+.switch.on i{transform:translateX(18px)}
+.save{width:100%;height:42px;border:0;border-radius:6px;background:var(--blue);color:#fff;font-weight:650;cursor:pointer;margin-top:5px}
+.status{font-size:11px;color:var(--green);background:#edf9f3;padding:9px;border-radius:6px;margin-bottom:18px}
+
+/* Responsive */
+@media(max-width:900px){
+  .nav{width:66px}
+  .brand span,.nav-item span,.account div:not(.avatar),.account-actions{display:none}
+  .brand{justify-content:center;padding:0}
+  .nav-item{justify-content:center;padding:0}
+  .account-row{justify-content:center}
+  .sessions{width:250px}
+}
+@media(max-width:650px){
+  .sessions{display:none}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="nav">
+    <div class="brand"><div class="logo">TG</div><span>TG Customer Service</span></div>
+    <div class="nav-items">
+      <div class="nav-item active"><span class="icon">💬</span><span>Chats</span></div>
+      <div class="nav-item"><span class="icon">👥</span><span>Contacts</span></div>
+      <div class="nav-item"><span class="icon">🏷️</span><span>Tags</span></div>
+      <div class="nav-item"><span class="icon">📊</span><span>Analytics</span></div>
+      <div class="nav-item" id="botSettings"><span class="icon">⚙️</span><span>Bot Settings</span></div>
+    </div>
+    <div class="spacer"></div>
+    <div class="account">
+      <div class="account-row">
+        <div class="avatar">👤</div>
+        <div><div style="font-size:12px;font-weight:600">Admin</div><small>Online</small></div>
+      </div>
+      <div class="account-actions"><span>Personal Settings</span><span>Quit</span></div>
+    </div>
+  </aside>
+
+  <section class="sessions">
+    <div class="search">
+      <div class="searchbox">⌕<input id="search" placeholder="Search session..."></div>
+    </div>
+    <div class="tabs">
+      <button class="tab">Waiting</button>
+      <button class="tab active">In progress</button>
+      <button class="tab">History</button>
+    </div>
+    <div class="filters">
+      <input class="check" type="checkbox" id="unread"><label for="unread" style="font-size:12px">Unread</label>
+      <select class="filter-select"><option>Tag filtering</option><option>VIP</option><option>Payment</option><option>Support</option></select>
+    </div>
+    <div class="session-list" id="sessionList">
+      <div class="session selected" data-name="Arjun Kumar">
+        <div class="session-avatar">AK</div><div class="session-main">
+          <div class="session-top"><div class="session-name">Arjun Kumar</div><div class="session-time">14:21</div></div>
+          <div class="session-msg">Hello, I need help with my account.</div>
+        </div><span class="badge">2</span>
+      </div>
+      <div class="session" data-name="Rahul Sharma">
+        <div class="session-avatar">RS</div><div class="session-main">
+          <div class="session-top"><div class="session-name">Rahul Sharma</div><div class="session-time">13:58</div></div>
+          <div class="session-msg">Is my verification completed?</div>
+        </div>
+      </div>
+      <div class="session" data-name="Priya">
+        <div class="session-avatar">P</div><div class="session-main">
+          <div class="session-top"><div class="session-name">Priya</div><div class="session-time">13:42</div></div>
+          <div class="session-msg">Thank you for your help.</div>
+        </div>
+      </div>
+      <div class="session" data-name="Mohammed Ali">
+        <div class="session-avatar">MA</div><div class="session-main">
+          <div class="session-top"><div class="session-name">Mohammed Ali</div><div class="session-time">12:30</div></div>
+          <div class="session-msg">Can you explain the next step?</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <main class="chat">
+    <header class="chat-header">
+      <div class="contact">
+        <div class="avatar">AK</div>
+        <div><div class="contact-name" id="contactName">Arjun Kumar</div><div class="online">● Online on Telegram</div></div>
+      </div>
+      <div class="header-actions">
+        <button class="hbtn" title="Search">⌕</button>
+        <button class="hbtn" title="Profile">👤</button>
+        <button class="hbtn" title="More">⋮</button>
+      </div>
+    </header>
+
+    <div class="messages" id="messages">
+      <div class="day">Today</div>
+      <div class="message in">Hello, I need help with my account.<div class="meta">14:20</div></div>
+      <div class="message in">I am not sure what I need to do next.<div class="meta">14:21</div></div>
+      <div class="message out">Hi Arjun! 👋 Sure, I can help you. Please tell me what you would like assistance with.<div class="meta">14:22 ✓✓</div></div>
+    </div>
+
+    <div class="composer">
+      <div class="compose-row">
+        <button class="attach" title="Attach">＋</button>
+        <textarea class="compose-input" id="messageInput" rows="1" placeholder="Write a message..."></textarea>
+        <button class="send" id="send">➤</button>
+      </div>
+      <div class="quick">
+        <button>👋 Hello</button><button>How can I help?</button><button>Please wait a moment</button><button>Thank you</button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div class="overlay" id="overlay">
+  <div class="drawer">
+    <div class="drawer-head"><h2>Telegram Bot Settings</h2><button class="close" id="close">✕</button></div>
+    <div class="status">● UI connection settings are ready</div>
+    <div class="field">
+      <label>Bot name</label>
+      <input id="botName" placeholder="My Customer Support Bot">
+    </div>
+    <div class="field">
+      <label>Telegram Bot Token</label>
+      <input id="token" type="password" placeholder="123456789:AA...">
+      <div class="help">For the UI prototype, the token is kept only in this browser's local storage. For production, store credentials securely on your backend.</div>
+    </div>
+    <div class="field">
+      <label>Webhook / API endpoint</label>
+      <input placeholder="https://your-domain.com/api/telegram/webhook">
+      <div class="help">This will be used by the backend when the real Telegram integration is connected.</div>
+    </div>
+    <div class="switch-row"><div><b style="font-size:13px">Auto-reply</b><div class="help">Enable automated replies from your bot.</div></div><div class="switch on"><i></i></div></div>
+    <div class="switch-row"><div><b style="font-size:13px">New message notifications</b><div class="help">Show an alert when a new Telegram message arrives.</div></div><div class="switch on"><i></i></div></div>
+    <div class="switch-row"><div><b style="font-size:13px">AI assistant</b><div class="help">Reserve this area for an OpenAI-powered reply assistant.</div></div><div class="switch"><i></i></div></div>
+    <button class="save" id="save">Save Bot Settings</button>
+  </div>
+</div>
+
+<script>
+const overlay=document.getElementById('overlay');
+const botSettings=document.getElementById('botSettings');
+const close=document.getElementById('close');
+const save=document.getElementById('save');
+const token=document.getElementById('token');
+const botName=document.getElementById('botName');
+
+botSettings.onclick=()=>overlay.classList.add('open');
+close.onclick=()=>overlay.classList.remove('open');
+overlay.onclick=e=>{if(e.target===overlay)overlay.classList.remove('open')};
+
+token.value=localStorage.getItem('tg_bot_token')||'';
+botName.value=localStorage.getItem('tg_bot_name')||'';
+
+save.onclick=()=>{
+  localStorage.setItem('tg_bot_token',token.value);
+  localStorage.setItem('tg_bot_name',botName.value);
+  save.textContent='Saved ✓';
+  setTimeout(()=>save.textContent='Save Bot Settings',1200);
+};
+
+document.querySelectorAll('.session').forEach(s=>{
+  s.onclick=()=>{
+    document.querySelectorAll('.session').forEach(x=>x.classList.remove('selected'));
+    s.classList.add('selected');
+    document.getElementById('contactName').textContent=s.dataset.name;
+  };
+});
+
+document.getElementById('search').addEventListener('input',e=>{
+  const q=e.target.value.toLowerCase();
+  document.querySelectorAll('.session').forEach(s=>{
+    s.style.display=s.dataset.name.toLowerCase().includes(q)?'flex':'none';
+  });
+});
+
+document.querySelectorAll('.quick button').forEach(b=>{
+  b.onclick=()=>document.getElementById('messageInput').value=b.textContent.replace(/^[^A-Za-z]+/,'');
+});
+
+const input=document.getElementById('messageInput');
+const messages=document.getElementById('messages');
+function sendMessage(){
+  const text=input.value.trim();
+  if(!text)return;
+  const m=document.createElement('div');
+  m.className='message out';
+  m.innerHTML=escapeHtml(text)+'<div class="meta">'+new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})+' ✓</div>';
+  messages.appendChild(m); input.value=''; messages.scrollTop=messages.scrollHeight;
+}
+function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));}
+document.getElementById('send').onclick=sendMessage;
+input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage();}});
+document.querySelectorAll('.switch').forEach(s=>s.onclick=()=>s.classList.toggle('on'));
+</script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: tg-support-platform
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tg-support-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: BOT_TOKEN_ENCRYPTION_KEY
+        generateValue: true
+      - key: MASTER_ADMIN_ID
+        value: MASTER-ADMIN-001
+      - key: MASTER_ADMIN_NAME
+        value: Master Admin
+      - key: MASTER_ADMIN_EMAIL
+        sync: false
+      - key: MASTER_ADMIN_PASSWORD
+        sync: false
+
+databases:
+  - name: tg-support-db
+    plan: starter
