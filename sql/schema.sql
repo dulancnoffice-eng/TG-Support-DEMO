@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_workspace_created ON audit_logs(workspace_id, created_at DESC);
 
--- OrbitDesk Live V3: one customer thread, reusable tags, remarks, soft deletion, translation cache.
+-- DLXN17 Customer Support Live V3: one customer thread, reusable tags, remarks, soft deletion, translation cache.
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS remark TEXT;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS remark_updated_by VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS remark_updated_at TIMESTAMPTZ;
@@ -166,4 +166,77 @@ CREATE TABLE IF NOT EXISTS message_translations (
 CREATE TABLE IF NOT EXISTS system_migrations (
   migration_key VARCHAR(160) PRIMARY KEY,
   applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- DLXN17 Customer Support Live V4: queue lifecycle, dashboard analytics, soft-deleted chat history.
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMPTZ;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deleted_by VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL;
+
+CREATE TABLE IF NOT EXISTS conversation_assignment_events (
+  id BIGSERIAL PRIMARY KEY,
+  workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  assigned_user_id VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
+  assigned_by VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_assignment_events_workspace_created ON conversation_assignment_events(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_assignment_events_user_created ON conversation_assignment_events(assigned_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_assignment_events_conversation ON conversation_assignment_events(conversation_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_conversations_deleted_at ON conversations(workspace_id, deleted_at DESC) WHERE deleted_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_conversations_resolved_at ON conversations(workspace_id, resolved_at DESC) WHERE resolved_at IS NOT NULL;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS waiting_since TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_conversations_waiting_since ON conversations(workspace_id, waiting_since) WHERE status='waiting';
+
+-- DLXN17 Customer Support V4 Remake: media database, bulk image sets, quick replies, and automation messages.
+CREATE TABLE IF NOT EXISTS media_categories (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  name VARCHAR(100) NOT NULL,
+  description TEXT,
+  created_by VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_media_categories_name_ci ON media_categories(workspace_id, lower(name));
+CREATE INDEX IF NOT EXISTS idx_media_categories_workspace ON media_categories(workspace_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS media_assets (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  category_id UUID NOT NULL REFERENCES media_categories(id) ON DELETE CASCADE,
+  filename VARCHAR(255) NOT NULL,
+  mime_type VARCHAR(120) NOT NULL,
+  byte_size INT NOT NULL CHECK (byte_size > 0),
+  file_data BYTEA NOT NULL,
+  created_by VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_media_assets_category ON media_assets(category_id, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_media_assets_workspace ON media_assets(workspace_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS quick_replies (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  title VARCHAR(80) NOT NULL,
+  body TEXT NOT NULL,
+  sort_order INT NOT NULL DEFAULT 0,
+  enabled BOOLEAN NOT NULL DEFAULT true,
+  created_by VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_quick_replies_workspace ON quick_replies(workspace_id, sort_order, created_at);
+
+CREATE TABLE IF NOT EXISTS automation_messages (
+  workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  trigger_type VARCHAR(30) NOT NULL CHECK (trigger_type IN ('new_customer','assigned')),
+  enabled BOOLEAN NOT NULL DEFAULT false,
+  body TEXT NOT NULL DEFAULT '',
+  updated_by VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY(workspace_id, trigger_type)
 );
