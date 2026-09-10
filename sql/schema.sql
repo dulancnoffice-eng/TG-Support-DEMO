@@ -133,3 +133,37 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_audit_workspace_created ON audit_logs(workspace_id, created_at DESC);
+
+-- OrbitDesk Live V3: one customer thread, reusable tags, remarks, soft deletion, translation cache.
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS remark TEXT;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS remark_updated_by VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS remark_updated_at TIMESTAMPTZ;
+
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_by VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS telegram_deleted BOOLEAN NOT NULL DEFAULT false;
+
+CREATE TABLE IF NOT EXISTS workspace_tags (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  name VARCHAR(40) NOT NULL,
+  created_by VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_workspace_tags_name_ci ON workspace_tags(workspace_id, lower(name));
+CREATE INDEX IF NOT EXISTS idx_workspace_tags_workspace ON workspace_tags(workspace_id, name);
+
+CREATE TABLE IF NOT EXISTS message_translations (
+  message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  target_language VARCHAR(12) NOT NULL,
+  translated_text TEXT NOT NULL,
+  detected_source_language VARCHAR(20),
+  provider VARCHAR(30) NOT NULL DEFAULT 'google',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY(message_id, target_language)
+);
+
+CREATE TABLE IF NOT EXISTS system_migrations (
+  migration_key VARCHAR(160) PRIMARY KEY,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
