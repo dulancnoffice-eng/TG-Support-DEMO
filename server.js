@@ -98,7 +98,7 @@ async function telegramApi(token, method, payload = {}) {
 async function telegramMultipart(token, method, fields, fileField, buffer, filename, mimeType) {
   const form = new FormData();
   for (const [k,v] of Object.entries(fields || {})) {
-    if (v !== undefined && v !== null) form.append(k, String(v));
+    if (v !== undefined && v !== null) form.append(k, typeof v === 'object' ? JSON.stringify(v) : String(v));
   }
   form.append(fileField, new Blob([buffer], { type:mimeType || 'application/octet-stream' }), filename || 'upload.bin');
   const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
@@ -119,21 +119,62 @@ function decodeBase64Upload(dataBase64, maxBytes=2_500_000) {
   if (!buffer.length || buffer.length > maxBytes) throw Object.assign(new Error('Upload is too large. Keep each file under 2.5 MB after image compression.'), { code:'UPLOAD_TOO_LARGE' });
   return buffer;
 }
-async function saveOutboundTelegramMedia(conversation, reqUserId, buffer, filename, mimeType, kind, source={}) {
+async function getReplyTarget(conversationId, replyToMessageId) {
+  if (!replyToMessageId) return null;
+  const { rows:[target] } = await pool.query(
+    `SELECT id,conversation_id,external_message_id,body,media,deleted_at FROM messages WHERE id=$1 AND conversation_id=$2`,
+    [replyToMessageId,conversationId]
+  );
+  if (!target) throw Object.assign(new Error('Reply target was not found in this conversation'), { code:'REPLY_TARGET_NOT_FOUND' });
+  if (target.deleted_at) throw Object.assign(new Error('Cannot reply to a deleted message'), { code:'REPLY_TARGET_DELETED' });
+  const external=String(target.external_message_id||'');
+  const split=external.lastIndexOf(':');
+  const telegramMessageId=split>0 ? Number(external.slice(split+1)) : null;
+  return { ...target, telegramMessageId:Number.isInteger(telegramMessageId)?telegramMessageId:null };
+}
+
+function telegramMediaDescriptor(message) {
+  if (Array.isArray(message.photo) && message.photo.length) {
+    const p=message.photo[message.photo.length-1];
+    return {kind:'image',filename:`telegram-photo-${message.message_id}.jpg`,mimeType:'image/jpeg',size:p.file_size||null,telegramFileId:p.file_id};
+  }
+  if (message.document) {
+    const mt=message.document.mime_type||'application/octet-stream';
+    return {kind:mt.startsWith('image/')?'image':'file',filename:message.document.file_name||`telegram-document-${message.message_id}`,mimeType:mt,size:message.document.file_size||null,telegramFileId:message.document.file_id};
+  }
+  return null;
+}
+
+function normalizeStoredMedia(media) {
+  if (!media || typeof media !== 'object') return media;
+  if (media.kind) return media;
+  const update=media.telegram;
+  const msg=update?.message || update?.edited_message;
+  return msg ? (telegramMediaDescriptor(msg) || media) : media;
+}
+
+async function saveOutboundTelegramMedia(conversation, reqUserId, buffer, filename, mimeType, kind, source={}, replyTarget=null) {
   const chatId = conversation.customer_metadata?.telegram_chat_id;
   if (!chatId) throw new Error('Telegram chat ID is missing for this customer');
   const token = decryptToken(conversation);
   const isImage = kind === 'image' || String(mimeType || '').startsWith('image/');
+  const fields={chat_id:chatId};
+  if (replyTarget?.telegramMessageId) fields.reply_parameters={message_id:replyTarget.telegramMessageId,allow_sending_without_reply:false};
   const sent = isImage
-    ? await telegramMultipart(token, 'sendPhoto', { chat_id:chatId }, 'photo', buffer, filename, mimeType)
-    : await telegramMultipart(token, 'sendDocument', { chat_id:chatId }, 'document', buffer, filename, mimeType);
+    ? await telegramMultipart(token, 'sendPhoto', fields, 'photo', buffer, filename, mimeType)
+    : await telegramMultipart(token, 'sendDocument', fields, 'document', buffer, filename, mimeType);
   const externalMessageId = `${chatId}:${sent.message_id}`;
   const body = isImage ? `[Image: ${filename}]` : `[File: ${filename}]`;
   const media = { kind:isImage?'image':'file', filename, mimeType, size:buffer.length, ...source };
   const { rows:[saved] } = await pool.query(
-    `INSERT INTO messages(conversation_id,sender_type,sender_user_id,body,external_message_id,media,created_at)
-     VALUES($1,'agent',$2,$3,$4,$5::jsonb,to_timestamp($6)) RETURNING *`,
-    [conversation.id,reqUserId,body,externalMessageId,JSON.stringify(media),Number(sent.date || Math.floor(Date.now()/1000))]
+    `INSERT INTO messages(conversation_id,sender_type,sender_user_id,body,external_message_id,media,reply_to_message_id,created_at)
+     VALUES($1,'agent',$2,$3,$4,$5::jsonb,$6,to_timestamp($7)) RETURNING *`,
+    [conversation.id,reqUserId,body,externalMessageId,JSON.stringify(media),replyTarget?.id||null,Number(sent.date || Math.floor(Date.now()/1000))]
+  );
+  await pool.query(
+    `INSERT INTO message_media_blobs(message_id,filename,mime_type,byte_size,file_data) VALUES($1,$2,$3,$4,$5)
+     ON CONFLICT(message_id) DO UPDATE SET filename=excluded.filename,mime_type=excluded.mime_type,byte_size=excluded.byte_size,file_data=excluded.file_data`,
+    [saved.id,filename,mimeType||'application/octet-stream',buffer.length,buffer]
   );
   await pool.query(`UPDATE conversations SET unread_count=0,last_message_at=now(),updated_at=now() WHERE id=$1`, [conversation.id]);
   return saved;
@@ -674,6 +715,7 @@ app.post('/api/telegram/webhook/:botId', asyncRoute(async (req,res) => {
   const username = from.username || null;
   const body = telegramMessageBody(message);
   const externalMessageId = `${chatId}:${message.message_id}`;
+  const mediaDescriptor = telegramMediaDescriptor(message);
 
   const metadataJson = JSON.stringify({ telegram_chat_id:chatId, telegram_username:username, chat_type:message.chat.type });
   const insertedCustomer = await pool.query(
@@ -718,12 +760,22 @@ app.post('/api/telegram/webhook/:botId', asyncRoute(async (req,res) => {
     }
   }
 
+  let replyToMessageId = null;
+  if (message.reply_to_message?.message_id) {
+    const replyExternal = `${chatId}:${message.reply_to_message.message_id}`;
+    const { rows:[replyRow] } = await pool.query(
+      `SELECT id FROM messages WHERE conversation_id=$1 AND external_message_id=$2 LIMIT 1`,
+      [conversation.id,replyExternal]
+    );
+    replyToMessageId = replyRow?.id || null;
+  }
+  const storedMedia = mediaDescriptor ? mediaDescriptor : { telegram:update };
   const inserted = await pool.query(
-    `INSERT INTO messages(conversation_id,sender_type,body,external_message_id,media,created_at)
-     VALUES($1,'customer',$2,$3,$4::jsonb,to_timestamp($5))
+    `INSERT INTO messages(conversation_id,sender_type,body,external_message_id,media,reply_to_message_id,created_at)
+     VALUES($1,'customer',$2,$3,$4::jsonb,$5,to_timestamp($6))
      ON CONFLICT DO NOTHING
      RETURNING id`,
-    [conversation.id,body,externalMessageId,JSON.stringify({ telegram:update }),Number(message.date || Math.floor(Date.now()/1000))]
+    [conversation.id,body,externalMessageId,JSON.stringify(storedMedia),replyToMessageId,Number(message.date || Math.floor(Date.now()/1000))]
   );
   if (inserted.rowCount) {
     await pool.query(
@@ -1075,15 +1127,21 @@ app.get('/api/conversations/:conversationId/messages', auth, asyncRoute(async (r
   const conversation = await getConversationForUser(req, req.params.conversationId, false);
   if (!conversation) return res.status(404).json({ error:'Conversation not found in your scope' });
   const { rows } = await pool.query(
-    `SELECT id,sender_type,sender_user_id,body,media,external_message_id,created_at,deleted_at,deleted_by,telegram_deleted
-       FROM messages WHERE conversation_id=$1 ORDER BY created_at ASC LIMIT 1000`, [conversation.id]
+    `SELECT m.id,m.sender_type,m.sender_user_id,m.body,m.media,m.external_message_id,m.created_at,m.deleted_at,m.deleted_by,m.telegram_deleted,m.reply_to_message_id,
+            r.body AS reply_to_body,r.sender_type AS reply_to_sender_type,r.sender_user_id AS reply_to_sender_user_id,r.media AS reply_to_media,r.deleted_at AS reply_to_deleted_at,
+            ru.name AS reply_to_sender_name
+       FROM messages m
+       LEFT JOIN messages r ON r.id=m.reply_to_message_id
+       LEFT JOIN users ru ON ru.id=r.sender_user_id
+      WHERE m.conversation_id=$1 ORDER BY m.created_at ASC LIMIT 1000`, [conversation.id]
   );
+  const items=rows.map(row=>({...row,media:normalizeStoredMedia(row.media),reply_to_media:normalizeStoredMedia(row.reply_to_media)}));
   await pool.query('UPDATE conversations SET unread_count=0 WHERE id=$1', [conversation.id]);
-  res.json({ conversation, items:rows });
+  res.json({ conversation, items });
 }));
 
 app.post('/api/conversations/:conversationId/messages', auth, asyncRoute(async (req,res) => {
-  const input = z.object({ text:z.string().min(1).max(4096) }).parse(req.body);
+  const input = z.object({ text:z.string().min(1).max(4096), replyToMessageId:z.string().uuid().nullable().optional() }).parse(req.body);
   const conversation = await getConversationForUser(req, req.params.conversationId, true);
   if (!conversation) return res.status(403).json({ error:'You do not have reply permission for this conversation' });
   if (['resolved','deleted'].includes(conversation.status)) return res.status(409).json({ error:'This conversation is in History. Wait for a new customer message to reopen it.' });
@@ -1091,12 +1149,15 @@ app.post('/api/conversations/:conversationId/messages', auth, asyncRoute(async (
   const chatId = conversation.customer_metadata?.telegram_chat_id;
   if (!chatId) return res.status(409).json({ error:'Telegram chat ID is missing for this customer' });
   const token = decryptToken(conversation);
-  const sent = await telegramApi(token, 'sendMessage', { chat_id:chatId, text:input.text });
+  const replyTarget = await getReplyTarget(conversation.id,input.replyToMessageId||null);
+  const payload={ chat_id:chatId, text:input.text };
+  if (replyTarget?.telegramMessageId) payload.reply_parameters={message_id:replyTarget.telegramMessageId,allow_sending_without_reply:false};
+  const sent = await telegramApi(token, 'sendMessage', payload);
   const externalMessageId = `${chatId}:${sent.message_id}`;
   const { rows:[saved] } = await pool.query(
-    `INSERT INTO messages(conversation_id,sender_type,sender_user_id,body,external_message_id,created_at)
-     VALUES($1,'agent',$2,$3,$4,to_timestamp($5)) RETURNING *`,
-    [conversation.id,req.user.id,input.text,externalMessageId,Number(sent.date || Math.floor(Date.now()/1000))]
+    `INSERT INTO messages(conversation_id,sender_type,sender_user_id,body,external_message_id,reply_to_message_id,created_at)
+     VALUES($1,'agent',$2,$3,$4,$5,to_timestamp($6)) RETURNING *`,
+    [conversation.id,req.user.id,input.text,externalMessageId,replyTarget?.id||null,Number(sent.date || Math.floor(Date.now()/1000))]
   );
   await pool.query(`UPDATE conversations SET unread_count=0,last_message_at=now(),updated_at=now() WHERE id=$1`, [conversation.id]);
   await audit(req,'conversation.reply','conversation',conversation.id,{botId:conversation.bot_id});
@@ -1290,9 +1351,46 @@ app.delete('/api/messages/:messageId', auth, asyncRoute(async (req,res) => {
   }
   await pool.query(`UPDATE messages SET body=NULL,media=NULL,deleted_at=now(),deleted_by=$2,telegram_deleted=$3 WHERE id=$1`, [message.id,req.user.id,remoteDeleted]);
   await pool.query('DELETE FROM message_translations WHERE message_id=$1', [message.id]);
+  await pool.query('DELETE FROM message_media_blobs WHERE message_id=$1', [message.id]);
   await pool.query(`UPDATE conversations SET last_message_at=(SELECT max(created_at) FROM messages WHERE conversation_id=$1 AND deleted_at IS NULL),updated_at=now() WHERE id=$1`, [message.conversation_id]);
   await audit(req,'message.delete','message',message.id,{conversationId:message.conversation_id,remoteDeleted,remoteError});
   res.json({ ok:true, remoteDeleted, remoteError });
+}));
+
+app.get('/api/messages/:messageId/media', auth, asyncRoute(async (req,res) => {
+  const { rows:[message] } = await pool.query(
+    `SELECT m.id,m.conversation_id,m.media,m.deleted_at,c.bot_id,b.token_ciphertext,b.token_iv,b.token_tag
+       FROM messages m JOIN conversations c ON c.id=m.conversation_id JOIN bots b ON b.id=c.bot_id
+      WHERE m.id=$1`, [req.params.messageId]
+  );
+  if (!message || message.deleted_at) return res.status(404).end();
+  const conversation=await getConversationForUser(req,message.conversation_id,false);
+  if (!conversation) return res.status(404).end();
+  const media=normalizeStoredMedia(message.media);
+  if (!media || media.kind!=='image') return res.status(404).end();
+
+  const { rows:[blob] }=await pool.query('SELECT filename,mime_type,file_data FROM message_media_blobs WHERE message_id=$1',[message.id]);
+  if (blob?.file_data) {
+    res.setHeader('Content-Type',blob.mime_type||'image/jpeg');
+    res.setHeader('Cache-Control','private, max-age=300');
+    return res.send(blob.file_data);
+  }
+  if (media.assetId) {
+    const { rows:[asset] }=await pool.query('SELECT mime_type,file_data FROM media_assets WHERE id=$1',[media.assetId]);
+    if (asset?.file_data) { res.setHeader('Content-Type',asset.mime_type||'image/jpeg'); res.setHeader('Cache-Control','private, max-age=300'); return res.send(asset.file_data); }
+  }
+  if (media.telegramFileId) {
+    const token=decryptToken(message);
+    const file=await telegramApi(token,'getFile',{file_id:media.telegramFileId});
+    if (!file?.file_path) return res.status(404).end();
+    const remote=await fetch(`https://api.telegram.org/file/bot${token}/${file.file_path}`,{signal:AbortSignal.timeout(15000)});
+    if (!remote.ok) return res.status(502).json({error:'Telegram media download failed'});
+    const buf=Buffer.from(await remote.arrayBuffer());
+    res.setHeader('Content-Type',media.mimeType||remote.headers.get('content-type')||'image/jpeg');
+    res.setHeader('Cache-Control','private, max-age=300');
+    return res.send(buf);
+  }
+  return res.status(404).end();
 }));
 
 app.get('/api/customers', auth, asyncRoute(async (req,res) => {
@@ -1320,14 +1418,16 @@ app.post('/api/conversations/:conversationId/media', auth, asyncRoute(async (req
     filename:z.string().trim().min(1).max(255),
     mimeType:z.string().trim().min(1).max(120),
     kind:z.enum(['image','file']),
-    dataBase64:z.string().min(8)
+    dataBase64:z.string().min(8),
+    replyToMessageId:z.string().uuid().nullable().optional()
   }).parse(req.body);
   const conversation = await getConversationForUser(req, req.params.conversationId, true);
   if (!conversation) return res.status(403).json({ error:'You do not have reply permission for this conversation' });
   if (['resolved','deleted'].includes(conversation.status)) return res.status(409).json({ error:'This conversation is in History. Wait for a new customer message to reopen it.' });
   if (conversation.status === 'waiting' || !conversation.assigned_user_id) return res.status(409).json({ error:'Assign the waiting conversation before sending files.' });
   const buffer = decodeBase64Upload(input.dataBase64);
-  const saved = await saveOutboundTelegramMedia(conversation,req.user.id,buffer,input.filename,input.mimeType,input.kind,{ source:'chat_upload' });
+  const replyTarget=await getReplyTarget(conversation.id,input.replyToMessageId||null);
+  const saved = await saveOutboundTelegramMedia(conversation,req.user.id,buffer,input.filename,input.mimeType,input.kind,{ source:'chat_upload' },replyTarget);
   await audit(req,'conversation.media.send','conversation',conversation.id,{filename:input.filename,mimeType:input.mimeType,size:buffer.length});
   res.status(201).json({ item:saved });
 }));
@@ -1409,13 +1509,15 @@ app.delete('/api/media/assets/:assetId', auth, allow('MASTER_ADMIN','WORKSPACE_A
 }));
 
 app.post('/api/conversations/:conversationId/media-assets/:assetId/send', auth, asyncRoute(async (req,res) => {
+  const input=z.object({replyToMessageId:z.string().uuid().nullable().optional()}).parse(req.body||{});
   const conversation=await getConversationForUser(req,req.params.conversationId,true);
   if (!conversation) return res.status(403).json({error:'You do not have reply permission for this conversation'});
   if (conversation.status==='waiting'||!conversation.assigned_user_id) return res.status(409).json({error:'Assign the waiting conversation before sending media'});
   if (['resolved','deleted'].includes(conversation.status)) return res.status(409).json({error:'History conversations are read-only'});
   const { rows:[asset] }=await pool.query('SELECT * FROM media_assets WHERE id=$1',[req.params.assetId]);
   if (!asset || String(asset.workspace_id)!==String(conversation.workspace_id)) return res.status(404).json({error:'Media asset not found in this workspace'});
-  const saved=await saveOutboundTelegramMedia(conversation,req.user.id,asset.file_data,asset.filename,asset.mime_type,'image',{source:'media_database',assetId:asset.id,categoryId:asset.category_id});
+  const replyTarget=await getReplyTarget(conversation.id,input.replyToMessageId||null);
+  const saved=await saveOutboundTelegramMedia(conversation,req.user.id,asset.file_data,asset.filename,asset.mime_type,'image',{source:'media_database',assetId:asset.id,categoryId:asset.category_id},replyTarget);
   await audit(req,'media.asset.send','conversation',conversation.id,{assetId:asset.id,categoryId:asset.category_id,filename:asset.filename});
   res.status(201).json({item:saved});
 }));
