@@ -36,7 +36,6 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
 CREATE INDEX IF NOT EXISTS idx_users_workspace ON users(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_users_parent ON users(parent_user_id);
 
@@ -57,6 +56,13 @@ CREATE TABLE IF NOT EXISTS bots (
   UNIQUE(workspace_id, platform, external_bot_id)
 );
 
+-- Migration-safe fields needed for real Telegram webhook operation.
+ALTER TABLE bots ADD COLUMN IF NOT EXISTS external_bot_username VARCHAR(120);
+ALTER TABLE bots ADD COLUMN IF NOT EXISTS webhook_secret TEXT;
+ALTER TABLE bots ADD COLUMN IF NOT EXISTS webhook_url TEXT;
+ALTER TABLE bots ADD COLUMN IF NOT EXISTS webhook_status VARCHAR(20) NOT NULL DEFAULT 'PENDING';
+ALTER TABLE bots ADD COLUMN IF NOT EXISTS last_webhook_error TEXT;
+
 CREATE TABLE IF NOT EXISTS bot_assignments (
   bot_id UUID NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
   user_id VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -67,6 +73,7 @@ CREATE TABLE IF NOT EXISTS bot_assignments (
   assigned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY(bot_id, user_id)
 );
+CREATE INDEX IF NOT EXISTS idx_bot_assignments_user ON bot_assignments(user_id, bot_id);
 
 CREATE TABLE IF NOT EXISTS customers (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -94,9 +101,10 @@ CREATE TABLE IF NOT EXISTS conversations (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
 CREATE INDEX IF NOT EXISTS idx_conversations_workspace_status ON conversations(workspace_id, status);
 CREATE INDEX IF NOT EXISTS idx_conversations_assigned_user ON conversations(assigned_user_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_bot_customer ON conversations(bot_id, customer_id, status);
+CREATE INDEX IF NOT EXISTS idx_conversations_last_message ON conversations(workspace_id, last_message_at DESC);
 
 CREATE TABLE IF NOT EXISTS messages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -108,6 +116,10 @@ CREATE TABLE IF NOT EXISTS messages (
   external_message_id VARCHAR(160),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_external_unique
+  ON messages(conversation_id, external_message_id)
+  WHERE external_message_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS audit_logs (
   id BIGSERIAL PRIMARY KEY,
@@ -120,5 +132,4 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   ip_address INET,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
 CREATE INDEX IF NOT EXISTS idx_audit_workspace_created ON audit_logs(workspace_id, created_at DESC);
