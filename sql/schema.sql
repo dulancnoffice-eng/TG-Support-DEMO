@@ -254,3 +254,30 @@ CREATE TABLE IF NOT EXISTS message_media_blobs (
   file_data BYTEA NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+
+-- DLXN17 V4.2.6: durable dashboard lifecycle events.
+ALTER TABLE conversation_assignment_events ADD COLUMN IF NOT EXISTS source_audit_id BIGINT;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_assignment_events_source_audit
+  ON conversation_assignment_events(source_audit_id)
+  WHERE source_audit_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS conversation_lifecycle_events (
+  id BIGSERIAL PRIMARY KEY,
+  workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  event_type VARCHAR(20) NOT NULL CHECK (event_type IN ('resolved','deleted','reopened')),
+  owner_user_id VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
+  actor_user_id VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
+  source_audit_id BIGINT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_workspace_type_created
+  ON conversation_lifecycle_events(workspace_id,event_type,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_owner_created
+  ON conversation_lifecycle_events(owner_user_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_actor_created
+  ON conversation_lifecycle_events(actor_user_id,created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_lifecycle_source_audit
+  ON conversation_lifecycle_events(source_audit_id)
+  WHERE source_audit_id IS NOT NULL;
