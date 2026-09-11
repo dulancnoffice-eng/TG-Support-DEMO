@@ -793,6 +793,13 @@ app.post('/api/telegram/webhook/:botId', asyncRoute(async (req,res) => {
       [conversation.id,Number(message.date || Math.floor(Date.now()/1000))]
     );
     const isReopenedChat = ['resolved','deleted'].includes(conversation.status);
+    if (isReopenedChat) {
+      await pool.query(
+        `INSERT INTO conversation_lifecycle_events(workspace_id,conversation_id,event_type,owner_user_id,actor_user_id,created_at)
+         VALUES($1,$2,'reopened',$3,NULL,to_timestamp($4))`,
+        [conversation.workspace_id,conversation.id,conversation.assigned_user_id||null,Number(message.date || Math.floor(Date.now()/1000))]
+      );
+    }
     if (isNewCustomer || isReopenedChat) {
       const automationConversation = {
         ...conversation,
@@ -924,22 +931,19 @@ app.get('/api/dashboard', auth, asyncRoute(async (req,res) => {
   }
 
   const period = ['today','week','month'].includes(String(req.query.period)) ? String(req.query.period) : 'today';
-  const start = dashboardPeriodStart(period);
+  let start = dashboardPeriodStart(period);
+  if (req.query.periodStart) {
+    const candidate = new Date(String(req.query.periodStart));
+    if (!Number.isNaN(candidate.getTime())) start = candidate;
+  }
+
   const unrestricted = ['MASTER_ADMIN','WORKSPACE_ADMIN'].includes(req.user.role);
   const scopeIds = unrestricted ? [] : await branchUserIds(req, req.user.workspace_id);
   const ids = scopeIds.length ? scopeIds : [req.user.id];
 
-  // Keep dashboard analytics deliberately dependent only on the long-lived core tables.
-  // This makes the dashboard survive incremental schema upgrades on serverless deployments.
-  // More precise lifecycle/event analytics can still be added later without making the whole
-  // dashboard fail when one optional analytics table/column is unavailable.
-  const params = [ws, start, ids];
-  const wsSql = `($1::uuid IS NULL OR c.workspace_id=$1)`;
-  const ownedSql = unrestricted ? '' : `AND c.assigned_user_id = ANY($3::varchar[])`;
-
-  const safeOne = async (sql, p=params, fallback={}) => {
+  const safeOne = async (sql, values, fallback={}) => {
     try {
-      const {rows:[row]} = await pool.query(sql,p);
+      const {rows:[row]} = await pool.query(sql, values);
       return row || fallback;
     } catch (err) {
       console.error('Dashboard metric query failed:', err.message);
@@ -947,116 +951,197 @@ app.get('/api/dashboard', auth, asyncRoute(async (req,res) => {
     }
   };
 
-  const received = await safeOne(
-    `SELECT count(DISTINCT c.customer_id)::int AS customers
-       FROM conversations c
-      WHERE ${wsSql} ${ownedSql}
-        AND EXISTS (
-          SELECT 1 FROM messages m
-           WHERE m.conversation_id=c.id
-             AND m.sender_type='customer'
-             AND m.created_at >= $2
-        )`,
-    params,{customers:0}
-  );
+  const restrictedConversationScope = `
+    (
+      c.assigned_user_id = ANY($3::varchar[])
+      OR EXISTS (
+        SELECT 1 FROM conversation_assignment_events ae_scope
+         WHERE ae_scope.conversation_id=c.id
+           AND ae_scope.assigned_user_id = ANY($3::varchar[])
+           AND ae_scope.created_at >= $2
+      )
+    )`;
 
-  const assigned = await safeOne(
-    `SELECT count(DISTINCT c.id)::int AS n
-       FROM conversations c
-      WHERE ${wsSql}
-        AND c.assigned_user_id IS NOT NULL
-        ${unrestricted ? '' : `AND c.assigned_user_id = ANY($3::varchar[])`}
-        AND c.updated_at >= $2`,
-    params,{n:0}
-  );
+  const received = unrestricted
+    ? await safeOne(
+        `SELECT count(DISTINCT c.customer_id)::int AS n
+           FROM conversations c
+           JOIN messages m ON m.conversation_id=c.id
+          WHERE ($1::uuid IS NULL OR c.workspace_id=$1)
+            AND m.sender_type='customer'
+            AND m.created_at >= $2`,
+        [ws,start], {n:0})
+    : await safeOne(
+        `SELECT count(DISTINCT c.customer_id)::int AS n
+           FROM conversations c
+           JOIN messages m ON m.conversation_id=c.id
+          WHERE ($1::uuid IS NULL OR c.workspace_id=$1)
+            AND m.sender_type='customer'
+            AND m.created_at >= $2
+            AND ${restrictedConversationScope}`,
+        [ws,start,ids], {n:0});
 
-  const deleted = await safeOne(
-    `SELECT count(DISTINCT c.id)::int AS n
-       FROM conversations c
-      WHERE ${wsSql}
-        AND c.status='deleted'
-        ${ownedSql}
-        AND c.updated_at >= $2`,
-    params,{n:0}
-  );
+  const assigned = unrestricted
+    ? await safeOne(
+        `SELECT count(DISTINCT ae.conversation_id)::int AS n
+           FROM conversation_assignment_events ae
+          WHERE ($1::uuid IS NULL OR ae.workspace_id=$1)
+            AND ae.assigned_user_id IS NOT NULL
+            AND ae.created_at >= $2`,
+        [ws,start], {n:0})
+    : await safeOne(
+        `SELECT count(DISTINCT ae.conversation_id)::int AS n
+           FROM conversation_assignment_events ae
+          WHERE ($1::uuid IS NULL OR ae.workspace_id=$1)
+            AND ae.assigned_user_id = ANY($3::varchar[])
+            AND ae.created_at >= $2`,
+        [ws,start,ids], {n:0});
 
-  const resolved = await safeOne(
-    `SELECT count(DISTINCT c.id)::int AS n
-       FROM conversations c
-      WHERE ${wsSql}
-        AND c.status='resolved'
-        ${ownedSql}
-        AND c.updated_at >= $2`,
-    params,{n:0}
-  );
+  const resolved = unrestricted
+    ? await safeOne(
+        `SELECT count(DISTINCT le.conversation_id)::int AS n
+           FROM conversation_lifecycle_events le
+          WHERE ($1::uuid IS NULL OR le.workspace_id=$1)
+            AND le.event_type='resolved'
+            AND le.created_at >= $2`,
+        [ws,start], {n:0})
+    : await safeOne(
+        `SELECT count(DISTINCT le.conversation_id)::int AS n
+           FROM conversation_lifecycle_events le
+          WHERE ($1::uuid IS NULL OR le.workspace_id=$1)
+            AND le.event_type='resolved'
+            AND le.created_at >= $2
+            AND (
+              le.owner_user_id = ANY($3::varchar[])
+              OR le.actor_user_id = ANY($3::varchar[])
+            )`,
+        [ws,start,ids], {n:0});
 
-  const active = await safeOne(
-    `SELECT count(*)::int AS n
-       FROM conversations c
-      WHERE ${wsSql}
-        AND c.status='in_progress'
-        ${ownedSql}`,
-    params,{n:0}
-  );
+  const deleted = unrestricted
+    ? await safeOne(
+        `SELECT count(DISTINCT le.conversation_id)::int AS n
+           FROM conversation_lifecycle_events le
+          WHERE ($1::uuid IS NULL OR le.workspace_id=$1)
+            AND le.event_type='deleted'
+            AND le.created_at >= $2`,
+        [ws,start], {n:0})
+    : await safeOne(
+        `SELECT count(DISTINCT le.conversation_id)::int AS n
+           FROM conversation_lifecycle_events le
+          WHERE ($1::uuid IS NULL OR le.workspace_id=$1)
+            AND le.event_type='deleted'
+            AND le.created_at >= $2
+            AND (
+              le.owner_user_id = ANY($3::varchar[])
+              OR le.actor_user_id = ANY($3::varchar[])
+            )`,
+        [ws,start,ids], {n:0});
 
-  let totalCustomers;
-  if (unrestricted) {
-    totalCustomers = await safeOne(
-      `SELECT count(*)::int AS n FROM customers cu WHERE ($1::uuid IS NULL OR cu.workspace_id=$1)`,
-      [ws],{n:0}
-    );
-  } else {
-    totalCustomers = await safeOne(
-      `SELECT count(DISTINCT c.customer_id)::int AS n
-         FROM conversations c
-        WHERE ${wsSql} AND c.assigned_user_id = ANY($3::varchar[])`,
-      params,{n:0}
-    );
-  }
+  const active = unrestricted
+    ? await safeOne(
+        `SELECT count(*)::int AS n
+           FROM conversations c
+          WHERE ($1::uuid IS NULL OR c.workspace_id=$1)
+            AND c.status='in_progress'`,
+        [ws], {n:0})
+    : await safeOne(
+        `SELECT count(*)::int AS n
+           FROM conversations c
+          WHERE ($1::uuid IS NULL OR c.workspace_id=$1)
+            AND c.status='in_progress'
+            AND c.assigned_user_id = ANY($2::varchar[])`,
+        [ws,ids], {n:0});
 
-  let waiting;
-  if (unrestricted) {
-    waiting = await safeOne(
-      `SELECT count(*)::int AS n,
-              COALESCE(EXTRACT(EPOCH FROM (now()-min(c.created_at)))::int,0) AS oldest_seconds
-         FROM conversations c
-        WHERE c.status='waiting' AND ${wsSql}`,
-      params,{n:0,oldest_seconds:0}
-    );
-  } else {
-    waiting = await safeOne(
-      `SELECT count(DISTINCT c.id)::int AS n,
-              COALESCE(EXTRACT(EPOCH FROM (now()-min(c.created_at)))::int,0) AS oldest_seconds
-         FROM conversations c
-        WHERE c.status='waiting'
-          AND c.assigned_user_id IS NULL
-          AND ${wsSql}
-          AND EXISTS (
-            SELECT 1 FROM bot_assignments ba
-             WHERE ba.bot_id=c.bot_id
-               AND ba.user_id = ANY($3::varchar[])
-               AND ba.can_read=true
-          )`,
-      params,{n:0,oldest_seconds:0}
-    );
-  }
+  const totalCustomers = unrestricted
+    ? await safeOne(
+        `SELECT count(*)::int AS n
+           FROM customers cu
+          WHERE ($1::uuid IS NULL OR cu.workspace_id=$1)`,
+        [ws], {n:0})
+    : await safeOne(
+        `SELECT count(DISTINCT c.customer_id)::int AS n
+           FROM conversations c
+          WHERE ($1::uuid IS NULL OR c.workspace_id=$1)
+            AND (
+              c.assigned_user_id = ANY($2::varchar[])
+              OR EXISTS (
+                SELECT 1 FROM conversation_assignment_events ae_hist
+                 WHERE ae_hist.conversation_id=c.id
+                   AND ae_hist.assigned_user_id = ANY($2::varchar[])
+              )
+            )`,
+        [ws,ids], {n:0});
 
-  const avgResponse = await safeOne(
-    `WITH scoped AS (
-       SELECT c.id
-         FROM conversations c
-        WHERE ${wsSql} ${ownedSql}
-     ), firsts AS (
-       SELECT s.id,
-              (SELECT min(m.created_at) FROM messages m WHERE m.conversation_id=s.id AND m.sender_type='customer' AND m.created_at >= $2) AS first_customer,
-              (SELECT min(m.created_at) FROM messages m WHERE m.conversation_id=s.id AND m.sender_type IN ('agent','bot') AND m.created_at >= $2) AS first_reply
-         FROM scoped s
-     )
-     SELECT COALESCE(avg(EXTRACT(EPOCH FROM (first_reply-first_customer)))
-              FILTER (WHERE first_customer IS NOT NULL AND first_reply>=first_customer),0)::int AS seconds
-       FROM firsts`,
-    params,{seconds:0}
-  );
+  const waiting = unrestricted
+    ? await safeOne(
+        `SELECT count(*)::int AS n,
+                COALESCE(EXTRACT(EPOCH FROM (now()-min(COALESCE(c.waiting_since,c.created_at))))::int,0) AS oldest_seconds
+           FROM conversations c
+          WHERE c.status='waiting'
+            AND ($1::uuid IS NULL OR c.workspace_id=$1)`,
+        [ws], {n:0,oldest_seconds:0})
+    : await safeOne(
+        `SELECT count(DISTINCT c.id)::int AS n,
+                COALESCE(EXTRACT(EPOCH FROM (now()-min(COALESCE(c.waiting_since,c.created_at))))::int,0) AS oldest_seconds
+           FROM conversations c
+          WHERE c.status='waiting'
+            AND c.assigned_user_id IS NULL
+            AND ($1::uuid IS NULL OR c.workspace_id=$1)
+            AND EXISTS (
+              SELECT 1 FROM bot_assignments ba
+               WHERE ba.bot_id=c.bot_id
+                 AND ba.user_id = ANY($2::varchar[])
+                 AND ba.can_read=true
+            )`,
+        [ws,ids], {n:0,oldest_seconds:0});
+
+  const avgResponse = unrestricted
+    ? await safeOne(
+        `WITH inbound AS (
+           SELECT c.id AS conversation_id, min(m.created_at) AS first_customer
+             FROM conversations c
+             JOIN messages m ON m.conversation_id=c.id
+            WHERE ($1::uuid IS NULL OR c.workspace_id=$1)
+              AND m.sender_type='customer'
+              AND m.created_at >= $2
+            GROUP BY c.id
+         ), paired AS (
+           SELECT i.conversation_id,i.first_customer,
+                  (SELECT min(r.created_at)
+                     FROM messages r
+                    WHERE r.conversation_id=i.conversation_id
+                      AND r.sender_type IN ('agent','bot')
+                      AND r.created_at >= i.first_customer) AS first_reply
+             FROM inbound i
+         )
+         SELECT COALESCE(avg(EXTRACT(EPOCH FROM (first_reply-first_customer)))
+                  FILTER (WHERE first_reply IS NOT NULL),0)::int AS seconds
+           FROM paired`,
+        [ws,start], {seconds:0})
+    : await safeOne(
+        `WITH inbound AS (
+           SELECT c.id AS conversation_id, min(m.created_at) AS first_customer
+             FROM conversations c
+             JOIN messages m ON m.conversation_id=c.id
+            WHERE ($1::uuid IS NULL OR c.workspace_id=$1)
+              AND m.sender_type='customer'
+              AND m.created_at >= $2
+              AND ${restrictedConversationScope}
+            GROUP BY c.id
+         ), paired AS (
+           SELECT i.conversation_id,i.first_customer,
+                  (SELECT min(r.created_at)
+                     FROM messages r
+                    WHERE r.conversation_id=i.conversation_id
+                      AND r.sender_type='agent'
+                      AND r.sender_user_id = ANY($3::varchar[])
+                      AND r.created_at >= i.first_customer) AS first_reply
+             FROM inbound i
+         )
+         SELECT COALESCE(avg(EXTRACT(EPOCH FROM (first_reply-first_customer)))
+                  FILTER (WHERE first_reply IS NOT NULL),0)::int AS seconds
+           FROM paired`,
+        [ws,start,ids], {seconds:0});
 
   let team=[];
   try {
@@ -1067,49 +1152,49 @@ app.get('/api/dashboard', auth, asyncRoute(async (req,res) => {
     userParams.push(start); const sp=userParams.length;
     const {rows}=await pool.query(
       `SELECT u.id,u.name,u.role,
-              (SELECT count(*)::int FROM conversations c WHERE c.assigned_user_id=u.id AND c.status='in_progress') AS active_now,
-              (SELECT count(*)::int FROM conversations c WHERE c.assigned_user_id=u.id AND c.updated_at >= $${sp}) AS assigned_period,
-              (SELECT count(*)::int FROM conversations c WHERE c.assigned_user_id=u.id AND c.status='deleted' AND c.updated_at >= $${sp}) AS deleted_period,
-              (SELECT count(*)::int FROM messages m WHERE m.sender_user_id=u.id AND m.sender_type='agent' AND m.created_at >= $${sp} AND m.deleted_at IS NULL) AS replies_period
+              (SELECT count(*)::int
+                 FROM conversations c
+                WHERE c.assigned_user_id=u.id
+                  AND c.status='in_progress') AS active_now,
+              (SELECT count(DISTINCT ae.conversation_id)::int
+                 FROM conversation_assignment_events ae
+                WHERE ae.assigned_user_id=u.id
+                  AND ae.created_at >= $${sp}) AS assigned_period,
+              (SELECT count(DISTINCT le.conversation_id)::int
+                 FROM conversation_lifecycle_events le
+                WHERE le.event_type='resolved'
+                  AND le.created_at >= $${sp}
+                  AND (le.owner_user_id=u.id OR le.actor_user_id=u.id)) AS resolved_period,
+              (SELECT count(DISTINCT le.conversation_id)::int
+                 FROM conversation_lifecycle_events le
+                WHERE le.event_type='deleted'
+                  AND le.created_at >= $${sp}
+                  AND (le.owner_user_id=u.id OR le.actor_user_id=u.id)) AS deleted_period,
+              (SELECT count(*)::int
+                 FROM messages m
+                WHERE m.sender_user_id=u.id
+                  AND m.sender_type='agent'
+                  AND m.created_at >= $${sp}
+                  AND m.deleted_at IS NULL) AS replies_period
          FROM users u
         WHERE ${where.join(' AND ')}
         ORDER BY CASE u.role WHEN 'WORKSPACE_ADMIN' THEN 1 WHEN 'TEAM_ADMIN' THEN 2 ELSE 3 END,u.name
-        LIMIT 100`, userParams
+        LIMIT 100`,
+      userParams
     );
     team=rows;
   } catch (err) {
     console.error('Dashboard team query failed:', err.message);
-    // Compatibility fallback for databases that predate message soft-delete columns.
-    try {
-      const userParams=[];
-      const where=[`u.status='active'`,`u.role IN ('WORKSPACE_ADMIN','TEAM_ADMIN','AGENT')`];
-      if (ws) { userParams.push(ws); where.push(`u.workspace_id=$${userParams.length}`); }
-      if (!unrestricted) { userParams.push(ids); where.push(`u.id = ANY($${userParams.length}::varchar[])`); }
-      userParams.push(start); const sp=userParams.length;
-      const {rows}=await pool.query(
-        `SELECT u.id,u.name,u.role,
-                (SELECT count(*)::int FROM conversations c WHERE c.assigned_user_id=u.id AND c.status='in_progress') AS active_now,
-                (SELECT count(*)::int FROM conversations c WHERE c.assigned_user_id=u.id AND c.updated_at >= $${sp}) AS assigned_period,
-                (SELECT count(*)::int FROM conversations c WHERE c.assigned_user_id=u.id AND c.status='deleted' AND c.updated_at >= $${sp}) AS deleted_period,
-                (SELECT count(*)::int FROM messages m WHERE m.sender_user_id=u.id AND m.sender_type='agent' AND m.created_at >= $${sp}) AS replies_period
-           FROM users u
-          WHERE ${where.join(' AND ')}
-          ORDER BY CASE u.role WHEN 'WORKSPACE_ADMIN' THEN 1 WHEN 'TEAM_ADMIN' THEN 2 ELSE 3 END,u.name
-          LIMIT 100`, userParams
-      );
-      team=rows;
-    } catch (fallbackErr) {
-      console.error('Dashboard team fallback failed:', fallbackErr.message);
-      team=[];
-    }
+    team=[];
   }
 
   res.json({
     period,
     periodStart:start.toISOString(),
+    generatedAt:new Date().toISOString(),
     scope:req.user.role==='MASTER_ADMIN'?(ws?'workspace':'all_workspaces'):req.user.role==='WORKSPACE_ADMIN'?'workspace':req.user.role==='TEAM_ADMIN'?'team':'self',
     metrics:{
-      received:Number(received.customers||0),
+      received:Number(received.n||0),
       assigned:Number(assigned.n||0),
       deleted:Number(deleted.n||0),
       resolved:Number(resolved.n||0),
@@ -1209,8 +1294,24 @@ app.post('/api/conversations/:conversationId/resolve', auth, asyncRoute(async (r
   const conversation = await getConversationForUser(req, req.params.conversationId, false);
   if (!conversation) return res.status(404).json({ error:'Conversation not found in your scope' });
   if (conversation.status === 'deleted') return res.status(409).json({ error:'Deleted conversation is already in History' });
-  await pool.query(`UPDATE conversations SET status='resolved',unread_count=0,resolved_at=now(),deleted_at=NULL,deleted_by=NULL,waiting_since=NULL,updated_at=now() WHERE id=$1`, [conversation.id]);
-  await audit(req,'conversation.resolve','conversation',conversation.id,{});
+  if (conversation.status === 'resolved') return res.json({ ok:true, alreadyResolved:true, status:'resolved' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`UPDATE conversations SET status='resolved',unread_count=0,resolved_at=now(),deleted_at=NULL,deleted_by=NULL,waiting_since=NULL,updated_at=now() WHERE id=$1`, [conversation.id]);
+    await client.query(
+      `INSERT INTO conversation_lifecycle_events(workspace_id,conversation_id,event_type,owner_user_id,actor_user_id)
+       VALUES($1,$2,'resolved',$3,$4)`,
+      [conversation.workspace_id,conversation.id,conversation.assigned_user_id||null,req.user.id]
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+  await audit(req,'conversation.resolve','conversation',conversation.id,{assignedUserId:conversation.assigned_user_id||null});
   res.json({ ok:true, status:'resolved' });
 }));
 
@@ -1220,8 +1321,23 @@ app.delete('/api/conversations/:conversationId', auth, asyncRoute(async (req,res
   if (req.user.role === 'VIEWER') return res.status(403).json({ error:'Viewer cannot delete conversations' });
   if (req.user.role === 'AGENT' && conversation.assigned_user_id !== req.user.id) return res.status(403).json({ error:'Agents can delete only conversations assigned to themselves' });
   if (conversation.status === 'deleted') return res.json({ ok:true, alreadyDeleted:true, status:'deleted' });
-  await pool.query(`UPDATE conversations SET status='deleted',unread_count=0,deleted_at=now(),deleted_by=$2,resolved_at=NULL,waiting_since=NULL,updated_at=now() WHERE id=$1`, [conversation.id,req.user.id]);
-  await audit(req,'conversation.delete','conversation',conversation.id,{assignedUserId:conversation.assigned_user_id});
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`UPDATE conversations SET status='deleted',unread_count=0,deleted_at=now(),deleted_by=$2,resolved_at=NULL,waiting_since=NULL,updated_at=now() WHERE id=$1`, [conversation.id,req.user.id]);
+    await client.query(
+      `INSERT INTO conversation_lifecycle_events(workspace_id,conversation_id,event_type,owner_user_id,actor_user_id)
+       VALUES($1,$2,'deleted',$3,$4)`,
+      [conversation.workspace_id,conversation.id,conversation.assigned_user_id||null,req.user.id]
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+  await audit(req,'conversation.delete','conversation',conversation.id,{assignedUserId:conversation.assigned_user_id||null});
   res.json({ ok:true, status:'deleted' });
 }));
 
@@ -1688,6 +1804,107 @@ async function runV4DataMigrations() {
   } finally { client.release(); }
 }
 
+async function runV426DashboardMigrations() {
+  const migrationKey = 'v4.2.6-dashboard-lifecycle-events';
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [migrationKey]);
+
+    // Backfill positive assignment events from the audit log when older builds did not preserve them.
+    await client.query(
+      `INSERT INTO conversation_assignment_events(workspace_id,conversation_id,assigned_user_id,assigned_by,created_at,source_audit_id)
+       SELECT c.workspace_id,
+              c.id,
+              CASE
+                WHEN al.action='conversation.claim' THEN al.actor_user_id
+                ELSE NULLIF(al.details->>'userId','')
+              END,
+              al.actor_user_id,
+              al.created_at,
+              al.id
+         FROM audit_logs al
+         JOIN conversations c ON c.id::text=al.entity_id
+        WHERE al.action IN ('conversation.assign','conversation.claim')
+          AND CASE
+                WHEN al.action='conversation.claim' THEN al.actor_user_id
+                ELSE NULLIF(al.details->>'userId','')
+              END IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM conversation_assignment_events ae WHERE ae.source_audit_id=al.id
+          )`
+    );
+
+    // Preserve historical resolve/delete activity even after a chat later reopens.
+    await client.query(
+      `INSERT INTO conversation_lifecycle_events(workspace_id,conversation_id,event_type,owner_user_id,actor_user_id,source_audit_id,created_at)
+       SELECT c.workspace_id,
+              c.id,
+              CASE WHEN al.action='conversation.resolve' THEN 'resolved' ELSE 'deleted' END,
+              COALESCE(
+                NULLIF(al.details->>'assignedUserId',''),
+                (SELECT ae_owner.assigned_user_id
+                   FROM conversation_assignment_events ae_owner
+                  WHERE ae_owner.conversation_id=c.id
+                    AND ae_owner.assigned_user_id IS NOT NULL
+                    AND ae_owner.created_at <= al.created_at
+                  ORDER BY ae_owner.created_at DESC
+                  LIMIT 1),
+                al.actor_user_id,
+                c.assigned_user_id
+              ),
+              al.actor_user_id,
+              al.id,
+              al.created_at
+         FROM audit_logs al
+         JOIN conversations c ON c.id::text=al.entity_id
+        WHERE al.action IN ('conversation.resolve','conversation.delete')
+          AND NOT EXISTS (
+            SELECT 1 FROM conversation_lifecycle_events le WHERE le.source_audit_id=al.id
+          )`
+    );
+
+    // Backfill currently resolved/deleted rows when no audit event is available.
+    await client.query(
+      `INSERT INTO conversation_lifecycle_events(workspace_id,conversation_id,event_type,owner_user_id,actor_user_id,created_at)
+       SELECT c.workspace_id,c.id,'resolved',c.assigned_user_id,c.assigned_user_id,c.resolved_at
+         FROM conversations c
+        WHERE c.status='resolved'
+          AND c.resolved_at IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM conversation_lifecycle_events le
+             WHERE le.conversation_id=c.id
+               AND le.event_type='resolved'
+               AND abs(EXTRACT(EPOCH FROM (le.created_at-c.resolved_at))) < 2
+          )`
+    );
+    await client.query(
+      `INSERT INTO conversation_lifecycle_events(workspace_id,conversation_id,event_type,owner_user_id,actor_user_id,created_at)
+       SELECT c.workspace_id,c.id,'deleted',c.assigned_user_id,c.deleted_by,c.deleted_at
+         FROM conversations c
+        WHERE c.status='deleted'
+          AND c.deleted_at IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM conversation_lifecycle_events le
+             WHERE le.conversation_id=c.id
+               AND le.event_type='deleted'
+               AND abs(EXTRACT(EPOCH FROM (le.created_at-c.deleted_at))) < 2
+          )`
+    );
+
+    await client.query(
+      `INSERT INTO system_migrations(migration_key) VALUES($1) ON CONFLICT DO NOTHING`,
+      [migrationKey]
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 async function initializeDatabase() {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not configured');
   const schemaPath = path.join(__dirname, 'sql', 'schema.sql');
@@ -1695,6 +1912,7 @@ async function initializeDatabase() {
   await pool.query(schema);
   await runDataMigrations();
   await runV4DataMigrations();
+  await runV426DashboardMigrations();
   console.log('Database schema is ready');
 }
 
